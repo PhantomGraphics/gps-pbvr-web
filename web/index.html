@@ -258,7 +258,7 @@
 
   // ------------------------------------------------------------------ session (reproducible state)
   const SETTING_IDS = ['preset', 'res', 'spp', 'density', 'target', 'perframe', 'maxpts', 'movecap', 'budget', 'pathmode', 'demandthr', 'sh', 'lod', 'seed', 'method', 'calib', 'basek', 'reflen'];
-  const CHECK_IDS = ['radial', 'centre', 'jitter', 'ydown'];
+  const CHECK_IDS = ['radial', 'centre', 'jitter', 'ydown', 'gamma'];
   const getSession = () => {
     const settings = {};
     for (const id of SETTING_IDS) settings[id] = $(id).value;
@@ -276,6 +276,7 @@
     for (const id of CHECK_IDS) if (st[id] !== undefined) $(id).checked = !!st[id];
     apply(); applyMethod(); applySh(); applyLod(); applySeed();
     viewer.set_y_down($('ydown').checked);
+    viewer.set_srgb_output($('gamma').checked);
     const c = s.camera;
     if (c) {
       if (c.up_y !== undefined) { $('ydown').checked = c.up_y < 0; viewer.set_y_down(c.up_y < 0); }
@@ -297,6 +298,7 @@
       const info = viewer.load_ply(buf);
       scene = { kind: 'ply', name: file.name, bytes: buf };
       $('ydown').checked = true;
+      $('gamma').checked = viewer.srgb_output();   // a 3DGS PLY loads with the sRGB OETF off
       syncSh(true);
       msg(`${file.name}: ${info}`, 'ok');
     } catch (e) { msg(`${file.name}: ${e}`, 'err'); }
@@ -306,7 +308,7 @@
   drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
   drop.addEventListener('dragleave', () => drop.classList.remove('over'));
   drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); e.dataTransfer.files[0] && loadBytes(e.dataTransfer.files[0]); });
-  $('demo').onclick = () => { try { msg(viewer.load_demo(), 'ok'); scene = { kind: 'demo', name: 'demo', bytes: null }; syncSh(); $('ydown').checked = false; } catch (e) { msg('' + e, 'err'); } };
+  $('demo').onclick = () => { try { msg(viewer.load_demo(), 'ok'); scene = { kind: 'demo', name: 'demo', bytes: null }; syncSh(); $('ydown').checked = false; viewer.set_srgb_output(true); $('gamma').checked = true; } catch (e) { msg('' + e, 'err'); } };
 
   // ------------------------------------------------------------------ canvas input
   // Navigation: left drag = orbit; right / middle drag, Shift+drag, or the "移動モード" toggle = pan;

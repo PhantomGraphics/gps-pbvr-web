@@ -265,6 +265,9 @@ impl Viewer {
             self.renderer.set_gaussians(&gpu).map_err(js_err)?;
         }
         self.frame_scene(&gpu, true);
+        // 3DGS PLY colours are display-referred (sRGB-space) values: show them unchanged. The sRGB OETF is for linear data.
+        self.params.srgb_output = false;
+        self.needs_present = true;
         let note = if g.sh_degree > 0 { format!(" (SH degree {})", g.sh_degree) } else { String::new() };
         self.scene_info = format!("{} Gaussians{note}", g.count);
         self.invalidate();
@@ -452,6 +455,10 @@ impl Viewer {
 
     /// Presentation only (no history reset): true = apply the sRGB OETF to the linear colours (default, the C++
     /// reference convention), false = show the stored colour values unchanged (how 3DGS viewers display PLY data).
+    pub fn srgb_output(&self) -> bool {
+        self.params.srgb_output
+    }
+
     pub fn set_srgb_output(&mut self, on: bool) {
         self.params.srgb_output = on;
         self.needs_present = true;
