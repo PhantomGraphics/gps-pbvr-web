@@ -266,6 +266,7 @@
   let panMode = false;
   const bindCanvas = () => {
     const pts = new Map();               // active pointers: id -> [x, y]
+    const downButton = new Map();        // button that started each drag (right / middle = pan)
     let gesture = null;                  // two-finger state
     cv.addEventListener('contextmenu', (e) => e.preventDefault());
     cv.addEventListener('auxclick', (e) => e.preventDefault());
@@ -273,13 +274,14 @@
     const height = () => cv.getBoundingClientRect().height;
     cv.addEventListener('pointerdown', (e) => {
       pts.set(e.pointerId, [e.clientX, e.clientY]);
+      downButton.set(e.pointerId, e.button);
       try { cv.setPointerCapture(e.pointerId); } catch {}
       if (pts.size === 2) {
         const [a, b] = [...pts.values()];
         gesture = { cx: (a[0] + b[0]) / 2, cy: (a[1] + b[1]) / 2, d: Math.hypot(a[0] - b[0], a[1] - b[1]) };
       }
     });
-    const end = (e) => { pts.delete(e.pointerId); if (pts.size < 2) gesture = null; };
+    const end = (e) => { pts.delete(e.pointerId); downButton.delete(e.pointerId); if (pts.size < 2) gesture = null; };
     cv.addEventListener('pointerup', end);
     cv.addEventListener('pointercancel', end);
     cv.addEventListener('pointermove', (e) => {
@@ -300,7 +302,8 @@
         return;
       }
       // CSS pixels, so the speed does not depend on the internal resolution
-      const pan = panMode || (e.buttons & 6) !== 0 || e.shiftKey;
+      const db = downButton.get(e.pointerId);
+      const pan = panMode || (e.buttons & 6) !== 0 || e.shiftKey || db === 1 || db === 2;
       if (pan) viewer.pan(dx, dy, height()); else viewer.orbit(dx, dy);
     });
     cv.addEventListener('wheel', (e) => { e.preventDefault(); if (!busy) viewer.zoom(e.deltaY); }, { passive: false });
