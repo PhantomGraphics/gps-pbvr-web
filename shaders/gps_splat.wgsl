@@ -666,3 +666,69 @@ fn particle_depth(@builtin(global_invocation_id) gid: vec3<u32>) { particle_pass
 
 @compute @workgroup_size(64)
 fn particle_color(@builtin(global_invocation_id) gid: vec3<u32>) { particle_pass(gid, 1u); }
+
+// ---------------------------------------------------------------- sorted alpha path (close views)
+// Classic depth-sorted Gaussian splatting for views whose GPS particle demand explodes (many large overlapping
+// splats): project -> radix sort (gps_sort.wgsl) -> back-to-front quads (gps_sorted_draw.wgsl) -> resolve into `accum`.
+// The image is the expectation of the GPS process (alpha = o exp(-r^2/2) composited by depth), without sampling noise.
+@group(1) @binding(0) var<storage, read_write> sp_proj: array<vec4<f32>>;   // 3 x vec4 per splat: (mean, o, K), (axis1, axis2), (rgb)
+@group(1) @binding(1) var<storage, read_write> sp_keys: array<u32>;
+@group(1) @binding(2) var<storage, read_write> sp_vals: array<u32>;
+@group(1) @binding(3) var<storage, read_write> sp_counter: array<atomic<u32>>; // [4 (vertex count), visible count, 0, 0]
+@group(1) @binding(4) var sp_tex: texture_2d<f32>;
+
+const SP_KEY_INVALID: u32 = 0xFFFFFFu;
+const SP_MIN_ALPHA: f32 = 0.00392156862745098;   // 1/255
+
+// Also accumulates the GPS particle demand (expected points of the on-screen splats) into stats[11] (+ carry stats[12]).
+@compute @workgroup_size(64)
+fn sp_project(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = thread_index(gid, frame.cfg.z);
+    if (i >= frame.dims.w) { return; }
+    sp_keys[i] = SP_KEY_INVALID;
+    sp_vals[i] = i;
+    let pr = project(i);
+    if (!pr.ok) { return; }
+    let o = clamp(splats[i * 4u].w, 0.0, 1.0);
+    if (o <= 0.0 || offscreen(pr)) { return; }
+
+    let en = expected_count(pr, o);
+    if (en > 0.0) {
+        let n = u32(min(en, 4.0e9));
+        let before = atomicAdd(&stats[11], n);
+        if (before + n < before) { atomicAdd(&stats[12], 1u); }
+    }
+    if (o < SP_MIN_ALPHA) { return; }
+
+    // quad extent: where o exp(-r^2/2) falls to 1/255
+    let k = sqrt(2.0 * log(o / SP_MIN_ALPHA));
+    let ex = k * sqrt(pr.a);
+    let ey = k * sqrt(pr.c);
+    if (pr.mean.x + ex < 0.0 || pr.mean.x - ex >= f32(frame.dims.x) || pr.mean.y + ey < 0.0 || pr.mean.y - ey >= f32(frame.dims.y)) { return; }
+
+    let tr2 = 0.5 * (pr.a + pr.c);
+    let disc = sqrt(max(tr2 * tr2 - (pr.a * pr.c - pr.b * pr.b), 0.0));
+    let l1 = tr2 + disc;
+    let l2 = max(tr2 - disc, 1e-12);
+    var v1 = vec2<f32>(1.0, 0.0);
+    if (abs(pr.b) > 1e-12) { v1 = normalize(vec2<f32>(l1 - pr.c, pr.b)); }
+    else if (pr.a < pr.c) { v1 = vec2<f32>(0.0, 1.0); }
+    let v2 = vec2<f32>(-v1.y, v1.x);
+    let col = splat_colour(i, splats[i * 4u + 3u].xyz);
+
+    sp_proj[i * 3u] = vec4<f32>(pr.mean, o, k);
+    sp_proj[i * 3u + 1u] = vec4<f32>(v1 * sqrt(l1), v2 * sqrt(l2));
+    sp_proj[i * 3u + 2u] = vec4<f32>(col, 0.0);
+    // far -> near ascending key (the sort is ascending; the quads are drawn back to front)
+    sp_keys[i] = 0xFFFFFEu - (bitcast<u32>(pr.depth) >> 8u);
+    atomicAdd(&sp_counter[1], 1u);
+}
+
+@compute @workgroup_size(64)
+fn sp_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = thread_index(gid, frame.cfg2.x);
+    let w = frame.dims.x;
+    if (i >= w * frame.dims.y) { return; }
+    let c = textureLoad(sp_tex, vec2<i32>(i32(i % w), i32(i / w)), 0);
+    accum[i] = vec4<f32>(c.xyz, 1.0);
+}

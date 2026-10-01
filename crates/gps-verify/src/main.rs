@@ -160,6 +160,9 @@ fn main() {
     if which == "all" || which == "phase0" {
         ok &= pollster::block_on(gps_render::run_phase0(&adapter, &mut |l| println!("{l}")));
     }
+    if which == "phase5" || which == "all" {
+        ok &= pollster::block_on(gps_render::verify::run_phase5(&adapter, &mut |l| println!("{l}")));
+    }
     if which == "phase4" || which == "all" {
         ok &= pollster::block_on(gps_render::verify::run_phase4(&adapter, &mut |l| println!("{l}")));
     }

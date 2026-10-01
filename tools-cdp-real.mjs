@@ -58,6 +58,7 @@ try {
   const waitAcc = async (n) => { for (let i = 0; i < 1200; i++) { const t = await stat(); if (accOf(t) >= n) return t; await sleep(500); } return await stat(); };
   const set = (id, v) => ev("(() => { const e = document.getElementById('" + id + "'); if (e.type === 'checkbox') e.checked = " + JSON.stringify(v) + "; else e.value = " + JSON.stringify(String(v)) + "; e.dispatchEvent(new Event('change')); })()");
   await set('target', 64);
+  if (process.env.PATHMODE) await set('pathmode', process.env.PATHMODE);   // 0 GPS, 1 sorted, 2 auto
   if (process.env.RES) await set('res', process.env.RES);   // e.g. 1280x720
   if (process.env.LOD) await set('lod', 'adaptive');
   console.log(await ev(`(async () => {

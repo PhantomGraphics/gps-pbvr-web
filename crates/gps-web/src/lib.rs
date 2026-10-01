@@ -80,6 +80,11 @@ PHASE4: FAIL")),
 }
 
 /// Interactive GPS viewer bound to a canvas.
+/// Auto path: scenes above this many splats never use the sorted path (its cost grows with the splat count).
+const SORT_MAX_SPLATS: u32 = 8_000_000;
+/// Auto path: a moving sorted frame slower than this (EMA, ms) for 20 frames hands motion over to GPS particles.
+const SORT_SLOW_MS: f64 = 60.0;
+
 #[wasm_bindgen]
 pub struct Viewer {
     renderer: GpsRenderer,
@@ -110,6 +115,25 @@ pub struct Viewer {
     /// points-per-ensemble budget (0 = off) and the automatic density factor that enforces it
     point_budget: f64,
     auto_density: f32,
+    /// render path: 0 = GPS particles, 1 = depth-sorted alpha, 2 = Auto (sorted when the GPS demand explodes)
+    path_mode: u32,
+    /// Auto: GPS particle demand (points per ensemble) above which the sorted path takes over
+    demand_threshold: f64,
+    /// the sorted path is in use for the current history window
+    sorted_active: bool,
+    /// the device cannot hold the sorted buffers, or sorting proved too slow: Auto stays on GPS
+    sorted_ok: bool,
+    /// Auto decision bookkeeping: epoch of the last probe / decision and frames waited for the probe readback
+    probe_epoch: u32,
+    decided_epoch: u32,
+    probe_wait: u32,
+    /// the demand probe's readback is valid once a snapshot with `issue` above this arrives
+    probe_issue: u32,
+    slow_frames: u32,
+    /// Auto: sorting every frame while the camera moves proved too slow, so motion uses GPS particles
+    /// (their capped preview); a still view is still decided by the demand probe
+    moving_prefers_gps: bool,
+    last_demand: u64,
     /// frames since the history last restarted (the stats readback lags by a few frames)
     frames_since_reset: u32,
     /// monotonic counters for the page's frame-time statistics (see `ensemble_counter`/`history_epoch`)
@@ -183,6 +207,17 @@ impl Viewer {
             lod_quiet: 0,
             point_budget: 0.0,
             auto_density: 1.0,
+            path_mode: 2,
+            demand_threshold: 30.0e6,
+            sorted_active: false,
+            sorted_ok: true,
+            probe_epoch: u32::MAX,
+            decided_epoch: u32::MAX,
+            probe_wait: 0,
+            probe_issue: 0,
+            slow_frames: 0,
+            moving_prefers_gps: false,
+            last_demand: 0,
             frames_since_reset: 0,
             ensemble_counter: 0,
             history_epoch: 0,
@@ -396,6 +431,25 @@ impl Viewer {
         }
     }
 
+    /// Render path: 0 = GPS particles, 1 = depth-sorted alpha compositing, 2 = Auto. Auto switches to the sorted path
+    /// when the GPS particle demand of the view exceeds `demand_threshold_millions` (million points per ensemble:
+    /// close views full of large overlapping splats) and falls back to GPS if sorting is unavailable or too slow.
+    /// The sorted path renders the expectation of the GPS process, without sampling noise. Only for the GPS particle
+    /// model: PBVR methods always use particles.
+    pub fn set_render_path(&mut self, mode: u32, demand_threshold_millions: f64) {
+        let mode = mode.min(2);
+        let thr = if demand_threshold_millions.is_finite() { demand_threshold_millions.clamp(0.1, 100000.0) * 1.0e6 } else { 30.0e6 };
+        if mode != self.path_mode || thr != self.demand_threshold {
+            self.path_mode = mode;
+            self.demand_threshold = thr;
+            self.sorted_ok = true;
+            self.moving_prefers_gps = false;
+            self.slow_frames = 0;
+            self.decided_epoch = u32::MAX;
+            self.invalidate();
+        }
+    }
+
     pub fn orbit(&mut self, dx: f64, dy: f64) {
         self.last_input_ms = self.last_frame_ms;
         self.cam.orbit(-dx * 0.005, dy * 0.005);
@@ -471,8 +525,89 @@ impl Viewer {
                 }
             }
         }
+        // ---- render path (GPS particles / depth-sorted alpha) ----
+        let moving_now = now_ms - self.last_input_ms < 250.0;
+        let cam = self.cam.to_camera(self.width, self.height);
+        let sorted_eligible = self.params.method == Method::Gps && self.renderer.gaussian_count() > 0 && self.renderer.gaussian_count() <= SORT_MAX_SPLATS;
+        let mut wait_for_probe = false;
+        match self.path_mode {
+            0 => self.sorted_active = false,
+            1 => self.sorted_active = sorted_eligible && self.sorted_ok,
+            _ => {
+                if !(sorted_eligible && self.sorted_ok) || (moving_now && self.moving_prefers_gps) {
+                    self.sorted_active = false;
+                } else if !moving_now && self.decided_epoch != self.history_epoch {
+                    // Still view: measure the GPS demand of this exact view first (cheap projection pass, no rendering),
+                    // then choose. Moving views keep the last choice (a probe per frame would stall the motion).
+                    let mut p = self.params;
+                    p.density_scale *= self.auto_density;
+                    if self.probe_epoch != self.history_epoch {
+                        match self.renderer.probe_demand(&cam, &p) {
+                            Ok(()) => {
+                                self.probe_epoch = self.history_epoch;
+                                self.probe_wait = 0;
+                                self.probe_issue = self.renderer.stats_issued();
+                            }
+                            Err(_) => {
+                                self.sorted_ok = false;
+                                self.sorted_active = false;
+                            }
+                        }
+                    }
+                    if self.probe_epoch == self.history_epoch {
+                        self.renderer.request_stats();
+                        self.probe_wait += 1;
+                        // a readback issued after the probe (an earlier one in flight would still show the old window)
+                        if self.renderer.latest_stats().issue > self.probe_issue {
+                            let demand = self.renderer.latest_stats().probe_demand as f64;
+                            self.last_demand = demand as u64;
+                            let keep = if self.sorted_active { 0.5 } else { 1.0 }; // hysteresis against flip-flopping near the threshold
+                            self.sorted_active = demand > keep * self.demand_threshold;
+                            self.decided_epoch = self.history_epoch;
+                        } else {
+                            wait_for_probe = true;
+                        }
+                    }
+                }
+            }
+        }
+        if self.sorted_active {
+            // Sorting too slow while the camera moves (every moving frame sorts again): give up, GPS particles take over.
+            if moving_now && self.path_mode == 2 {
+                self.slow_frames = if self.ema_ms > SORT_SLOW_MS { self.slow_frames + 1 } else { 0 };
+                if self.slow_frames >= 20 {
+                    self.moving_prefers_gps = true;
+                    self.sorted_active = false;
+                    self.slow_frames = 0;
+                    self.invalidate();
+                }
+            }
+        } else {
+            self.slow_frames = 0;
+        }
+
         let stalled = acc == 0 && self.renderer.submitted() >= 8;
-        if acc < self.target && !stalled {
+        if self.sorted_active && !wait_for_probe {
+            if acc < self.target {
+                let mut p = self.params;
+                p.density_scale *= self.auto_density;
+                match self.renderer.render_sorted(&cam, &p, self.target) {
+                    Ok(()) => {
+                        self.effective_per_frame = 0;
+                        self.ensemble_counter = self.ensemble_counter.wrapping_add(1);
+                        self.needs_present = true;
+                    }
+                    Err(_) => {
+                        // cannot hold the buffers: fall back to GPS particles
+                        self.sorted_ok = false;
+                        self.sorted_active = false;
+                        self.invalidate();
+                    }
+                }
+            }
+        } else if wait_for_probe {
+            // waiting for the demand probe; keep the previous picture on screen
+        } else if acc < self.target && !stalled {
             let moving = now_ms - self.last_input_ms < 250.0;
             if moving {
                 self.lod_n = 1;
@@ -498,7 +633,6 @@ impl Viewer {
             };
             self.effective_per_frame = want;
             let n = want.min(self.target - acc);
-            let cam = self.cam.to_camera(self.width, self.height);
             let mut p = self.params;
             p.density_scale *= self.auto_density;
             if self.lod_moving {
@@ -559,7 +693,7 @@ impl Viewer {
         let s = self.renderer.latest_stats();
         let m = estimate_memory(self.width, self.height, self.params.spp_side, self.renderer.gaussian_count() as usize);
         format!(
-            "{{\"scene\":\"{}\",\"gaussians\":{},\"width\":{},\"height\":{},\"spp\":{},\"accumulated\":{},\"target\":{},\"points\":{},\"visible\":{},\"truncated_splats\":{},\"dropped_points\":{},\"seed\":{},\"lod_moving\":{},\"ensembles_per_frame\":{},\"sh_max\":{},\"sh_degree\":{},\"orphan\":{},\"candidates\":{},\"undercovered\":{},\"skipped\":{},\"density_auto\":{:.3},\"method\":\"{}\",\"memory_mib\":{:.1},\"yaw\":{:.4},\"pitch\":{:.4},\"distance\":{:.4}}}",
+            "{{\"scene\":\"{}\",\"gaussians\":{},\"width\":{},\"height\":{},\"spp\":{},\"accumulated\":{},\"target\":{},\"points\":{},\"visible\":{},\"truncated_splats\":{},\"dropped_points\":{},\"seed\":{},\"lod_moving\":{},\"ensembles_per_frame\":{},\"sh_max\":{},\"sh_degree\":{},\"orphan\":{},\"candidates\":{},\"undercovered\":{},\"skipped\":{},\"density_auto\":{:.3},\"path\":\"{}\",\"demand\":{},\"method\":\"{}\",\"memory_mib\":{:.1},\"yaw\":{:.4},\"pitch\":{:.4},\"distance\":{:.4}}}",
             self.scene_info.replace('"', "'"),
             self.renderer.gaussian_count(),
             self.width,
@@ -581,6 +715,8 @@ impl Viewer {
             s.undercovered_splats,
             s.skipped_ensembles,
             self.auto_density,
+            if self.sorted_active { "sorted" } else { "gps" },
+            self.last_demand,
             self.params.method.name(),
             (m.total() + self.renderer.sh_bytes()) as f64 / 1048576.0,
             self.cam.yaw,

@@ -4,7 +4,7 @@
 //! clones. Errors are returned as `Result<_, String>` for the UI (no panics on user input).
 
 use bytemuck::{Pod, Zeroable};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use gps_core::oracle::OracleCamera;
 
@@ -237,6 +237,10 @@ pub struct GpuStats {
     pub skipped_ensembles: u64,
     /// ensembles the GPU has started in this counter window (the readback lags submissions)
     pub ensembles: u64,
+    /// GPS particle demand of the last `probe_demand` / `render_sorted` view (expected points per ensemble)
+    pub probe_demand: u64,
+    /// 1-based number of the readback this snapshot came from (0 = none yet); see `stats_issued`
+    pub issue: u32,
 }
 
 impl GpuStats {
@@ -253,6 +257,8 @@ impl GpuStats {
             undercovered_splats: c(6),
             skipped_ensembles: w[7] as u64,
             ensembles: w[10] as u64,
+            probe_demand: w[11] as u64 | (w[12] as u64) << 32,
+            issue: 0,
         }
     }
 }
@@ -278,7 +284,7 @@ pub fn estimate_memory(width: u32, height: u32, spp_side: u32, n_splats: usize) 
 
 /// (groups_x, groups_y, stride in threads) covering `n` threads with 64-thread groups, staying
 /// within the 65535-groups-per-dimension limit that browsers enforce.
-fn split_dispatch(n: u64) -> (u32, u32, u32) {
+pub(crate) fn split_dispatch(n: u64) -> (u32, u32, u32) {
     let groups = n.div_ceil(64).max(1);
     let gx = groups.min(65535);
     let gy = groups.div_ceil(gx);
@@ -343,6 +349,9 @@ pub struct GpsRenderer {
     stats_staging: wgpu::Buffer,
     stats_pending: Arc<AtomicBool>,
     stats_latest: Arc<Mutex<GpuStats>>,
+    /// readbacks issued so far; `GpuStats::issue` of a delivered snapshot is its 1-based issue number
+    stats_issued: Arc<AtomicU32>,
+    sorted: crate::sorted::SortedPath,
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -432,6 +441,7 @@ impl GpsRenderer {
             })
         };
         let (pl_scan, pl_scan_add) = (mk_scan("scan_block"), mk_scan("add_offsets"));
+        let sorted = crate::sorted::SortedPath::new(&device, &module, &bgl);
 
         // composite
         let cmod = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gps_composite"), source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.into()) });
@@ -543,6 +553,8 @@ impl GpsRenderer {
             stats_staging,
             stats_pending: Arc::new(AtomicBool::new(false)),
             stats_latest: Arc::new(Mutex::new(GpuStats::default())),
+            stats_issued: Arc::new(AtomicU32::new(0)),
+            sorted,
         };
         r.realloc_frame_buffers()?;
         r.set_gaussians(&[])?;
@@ -782,32 +794,20 @@ impl GpsRenderer {
 
     pub fn reset_stats(&self) {
         self.queue.write_buffer(&self.stats, 0, &[0u8; STATS_WORDS * 4]);
+        // the CPU copy of the counters belongs to the window being discarded as well
+        if let Ok(mut g) = self.stats_latest.lock() {
+            *g = GpuStats::default();
+        }
     }
 
-    /// Encodes `count` ensembles (independent sample sets; seeds `first_seed..first_seed+count`).
-    /// Each ensemble reads its own uniform slot, so all of them can be recorded in one
-    /// submission without a later `write_buffer` overwriting an earlier ensemble's parameters.
-    pub fn render_ensembles(&mut self, cam: &OracleCamera, params: &RenderParams, first_seed: u32, count: u32) -> Result<(), String> {
-        if count == 0 {
-            return Ok(());
-        }
-        if count > MAX_ENSEMBLES_PER_SUBMIT {
-            return Err(format!("at most {MAX_ENSEMBLES_PER_SUBMIT} ensembles per submission"));
-        }
-        if params.spp_side.clamp(1, 4) != self.spp_side {
-            return Err("params.spp_side differs from the renderer's; call resize() first".into());
-        }
+    /// Writes the per-ensemble uniform slots (ensemble `e` uses seed `first_seed + e`).
+    fn upload_frame(&self, cam: &OracleCamera, params: &RenderParams, first_seed: u32, count: u32) {
         let n_sub = self.width as u64 * self.height as u64 * (self.spp_side * self.spp_side) as u64;
-        let (sx, sy, stride_sub) = split_dispatch(n_sub);
-        let (px, py, stride_pix) = split_dispatch(self.width as u64 * self.height as u64);
-        let (gx, gy, stride_splat) = split_dispatch(self.n_splats as u64);
-        if sy > 65535 || py > 65535 || gy > 65535 {
-            return Err("dispatch too large".into());
-        }
-
+        let (_, _, stride_sub) = split_dispatch(n_sub);
+        let (_, _, stride_pix) = split_dispatch(self.width as u64 * self.height as u64);
+        let (_, _, stride_splat) = split_dispatch(self.n_splats as u64);
         // Same convention as the CPU oracle: a principal point of exactly (0,0) means "image centre".
         let (cx, cy) = if cam.cx == 0.0 && cam.cy == 0.0 { (0.5 * self.width as f64, 0.5 * self.height as f64) } else { (cam.cx, cam.cy) };
-        // The scan total is u32; the shader detects an overflowing total exactly and skips (and counts) that ensemble.
         let max_points = params.max_points_per_splat.max(1);
         let r = cam.view_rot.transpose(); // columns of the transpose = rows of view_rot
         let rows = [r.col(0), r.col(1), r.col(2)];
@@ -845,6 +845,31 @@ impl GpsRenderer {
             slots[o..o + std::mem::size_of::<FrameUniform>()].copy_from_slice(bytemuck::bytes_of(&u));
         }
         self.queue.write_buffer(&self.uniform, 0, &slots);
+    }
+
+    /// Encodes `count` ensembles (independent sample sets; seeds `first_seed..first_seed+count`).
+    /// Each ensemble reads its own uniform slot, so all of them can be recorded in one
+    /// submission without a later `write_buffer` overwriting an earlier ensemble's parameters.
+    pub fn render_ensembles(&mut self, cam: &OracleCamera, params: &RenderParams, first_seed: u32, count: u32) -> Result<(), String> {
+        if count == 0 {
+            return Ok(());
+        }
+        if count > MAX_ENSEMBLES_PER_SUBMIT {
+            return Err(format!("at most {MAX_ENSEMBLES_PER_SUBMIT} ensembles per submission"));
+        }
+        if params.spp_side.clamp(1, 4) != self.spp_side {
+            return Err("params.spp_side differs from the renderer's; call resize() first".into());
+        }
+        let n_sub = self.width as u64 * self.height as u64 * (self.spp_side * self.spp_side) as u64;
+        let (sx, sy, _) = split_dispatch(n_sub);
+        let (px, py, _) = split_dispatch(self.width as u64 * self.height as u64);
+        let (gx, gy, _) = split_dispatch(self.n_splats as u64);
+        if sy > 65535 || py > 65535 || gy > 65535 {
+            return Err("dispatch too large".into());
+        }
+
+        let method = params.method;
+        self.upload_frame(cam, params, first_seed, count);
 
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gps ensembles") });
         let use_particles = (params.path == RenderPath::Particle || method != Method::Gps) && self.n_splats > 0;
@@ -889,6 +914,44 @@ impl GpsRenderer {
         self.queue.submit([enc.finish()]);
         self.accumulated += count;
         Ok(())
+    }
+
+    /// Depth-sorted alpha rendering of the current view (no sampling noise). Writes the finished image into the
+    /// accumulation buffer with count 1 and reports it as `as_ensembles` accumulated ensembles, so callers that
+    /// wait for an accumulation target treat it as converged. Err when this device cannot hold the buffers.
+    pub fn render_sorted(&mut self, cam: &OracleCamera, params: &RenderParams, as_ensembles: u32) -> Result<(), String> {
+        self.sorted.ensure(&self.device, &self.queue, &self.scan_bgl, self.n_splats, self.width, self.height)?;
+        if params.spp_side.clamp(1, 4) != self.spp_side {
+            return Err("params.spp_side differs from the renderer's; call resize() first".into());
+        }
+        let params = RenderParams { method: Method::Gps, ..*params };
+        self.upload_frame(cam, &params, 0, 1);
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sorted frame") });
+        self.sorted.encode_render(
+            &self.queue, &self.stats, &mut enc, &self.bind_groups[0], self.n_splats, self.width, self.height, params.background, &self.pl_scan, &self.pl_scan_add,
+        );
+        self.queue.submit([enc.finish()]);
+        self.accumulated = as_ensembles.max(1);
+        Ok(())
+    }
+
+    /// Cheap GPS-demand probe: projects every splat and sums the expected particle counts of the on-screen ones
+    /// into the stats (`GpuStats::probe_demand`, delivered by the async readback). Does not touch the image.
+    pub fn probe_demand(&mut self, cam: &OracleCamera, params: &RenderParams) -> Result<(), String> {
+        self.sorted.ensure(&self.device, &self.queue, &self.scan_bgl, self.n_splats, self.width, self.height)?;
+        self.upload_frame(cam, params, 0, 1);
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("demand probe") });
+        self.sorted.encode_probe(&self.queue, &self.stats, &mut enc, &self.bind_groups[0], self.n_splats);
+        self.queue.submit([enc.finish()]);
+        Ok(())
+    }
+
+    /// Test hook: reads back the sorted keys and values of the last `render_sorted` (n entries each).
+    pub async fn read_sorted(&self) -> Option<(Vec<u32>, Vec<u32>)> {
+        let (k, v) = self.sorted.sorted_buffers()?;
+        let bytes = self.n_splats as u64 * 4;
+        let (kr, vr) = (self.read_buffer(k, bytes).await, self.read_buffer(v, bytes).await);
+        Some((bytemuck::cast_slice::<u8, u32>(&kr).to_vec(), bytemuck::cast_slice::<u8, u32>(&vr).to_vec()))
     }
 
     /// Records the composite pass into `view`, which must have this renderer's target format
@@ -938,6 +1001,7 @@ impl GpsRenderer {
         let mut enc = self.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_buffer(&self.stats, 0, &self.stats_staging, 0, (STATS_WORDS * 4) as u64);
         self.queue.submit([enc.finish()]);
+        let issue = self.stats_issued.fetch_add(1, Ordering::AcqRel) + 1;
         let (staging, pending, latest) = (self.stats_staging.clone(), self.stats_pending.clone(), self.stats_latest.clone());
         self.stats_staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             if r.is_ok() {
@@ -945,12 +1009,19 @@ impl GpsRenderer {
                     let w: &[u32] = bytemuck::cast_slice(&view);
                     if let Ok(mut g) = latest.lock() {
                         *g = GpuStats::from_words(w);
+                        g.issue = issue;
                     }
                 }
                 staging.unmap();
             }
             pending.store(false, Ordering::Release);
         });
+    }
+
+    /// Number of stats readbacks issued so far. A snapshot with `issue` greater than the value read right after a
+    /// GPU submission was copied after that submission completed.
+    pub fn stats_issued(&self) -> u32 {
+        self.stats_issued.load(Ordering::Acquire)
     }
 
     /// Most recent stats delivered by [`request_stats`](Self::request_stats).

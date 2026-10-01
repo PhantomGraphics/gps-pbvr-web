@@ -639,3 +639,147 @@ pub async fn run_phase4(adapter: &wgpu::Adapter, log: &mut dyn FnMut(String)) ->
     log(if ok { "PHASE4: PASS".into() } else { "PHASE4: FAIL".into() });
     ok
 }
+
+/// Phase 5: the depth-sorted alpha path (close views). Thresholds fixed in advance: PSNR >= 40 dB and SSIM >= 0.99 against
+/// the analytic alpha composite, a stable ascending radix sort that returns a permutation, and a demand probe that matches
+/// the particle counts the GPS path actually generates (within 2 %).
+pub async fn run_phase5(adapter: &wgpu::Adapter, log: &mut dyn FnMut(String)) -> bool {
+    let (device, queue) = match adapter
+        .request_device(&wgpu::DeviceDescriptor { label: Some("gps-phase5"), required_limits: adapter.limits(), ..Default::default() })
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            log(format!("request_device failed: {e}"));
+            return false;
+        }
+    };
+    let mut r = match GpsRenderer::new(device, queue, wgpu::TextureFormat::Rgba8Unorm, W as u32, H as u32, SPP_SIDE) {
+        Ok(r) => r,
+        Err(e) => {
+            log(format!("renderer init failed: {e}"));
+            return false;
+        }
+    };
+    let bg = DVec3::new(BG[0] as f64, BG[1] as f64, BG[2] as f64);
+    let params = RenderParams { spp_side: SPP_SIDE, background: BG, ..Default::default() };
+    let mut ok = true;
+
+    // many overlapping splats of all sizes / opacities
+    let mut seed = 4242u32;
+    let mut rnd = || {
+        seed = gps_core::pcg_hash(seed);
+        seed as f64 / 4_294_967_296.0
+    };
+    let mut crowd = Vec::new();
+    for _ in 0..3000 {
+        let s = 0.04 + 0.2 * rnd();
+        crowd.push(Gaussian3D {
+            pos: DVec3::new(-1.3 + 2.6 * rnd(), -1.3 + 2.6 * rnd(), 4.0 + 5.0 * rnd()),
+            log_scale: DVec3::new(s.ln(), (s * (0.3 + rnd())).ln(), (s * 0.5).ln()),
+            rot: DQuat::from_xyzw(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5, rnd() + 0.2).normalize(),
+            opacity: 0.2 + 0.7 * rnd(),
+            color: DVec3::new(rnd(), rnd(), rnd()),
+        });
+    }
+    let mut all = scenes();
+    all.push(("crowd of 3000", crowd.clone()));
+
+    for (name, scene) in &all {
+        let gg: Vec<_> = scene.iter().map(GpuGaussian::from_oracle).collect();
+        if let Err(e) = r.set_gaussians(&gg) {
+            log(format!("[{name}] upload failed: {e}"));
+            return false;
+        }
+        r.reset_accum();
+        if let Err(e) = r.render_sorted(&camera(), &params, 1) {
+            log(format!("[{name}] render_sorted failed: {e}"));
+            return false;
+        }
+        let acc = r.read_accum().await;
+        let img = to_image(&acc);
+        let ana = render_analytic(scene, camera(), W, H, bg);
+        let (p, ss) = (psnr(&img, &ana), ssim(&img, &ana, W, H));
+        let pass = p >= 40.0 && ss >= 0.99 && acc.iter().all(|a| a[3] == 1.0);
+        log(format!("[{name} / sorted] vs analytic PSNR={p:.1} dB SSIM={ss:.4}: {}", if pass { "ok" } else { "FAIL" }));
+        ok &= pass;
+    }
+
+    // sort correctness on the crowd (last scene rendered above is the crowd)
+    if let Some((keys, vals)) = r.read_sorted().await {
+        let sorted = keys.windows(2).all(|w| w[0] <= w[1]);
+        let mut seen = vec![false; vals.len()];
+        let perm = vals.iter().all(|&v| (v as usize) < seen.len() && !std::mem::replace(&mut seen[v as usize], true));
+        let valid = keys.iter().filter(|&&k| k != 0xFFFFFF).count();
+        let pass = sorted && perm && valid > 0;
+        log(format!("[radix sort] {} keys ascending={sorted} permutation={perm} visible={valid}: {}", keys.len(), if pass { "ok" } else { "FAIL" }));
+        ok &= pass;
+    } else {
+        log("[radix sort] no buffers".into());
+        ok = false;
+    }
+
+    // multi-level scan (histogram larger than 65536): 300k small splats
+    {
+        let big: Vec<_> = (0..300_000)
+            .map(|_| {
+                GpuGaussian::from_oracle(&Gaussian3D {
+                    pos: DVec3::new(-1.3 + 2.6 * rnd(), -1.3 + 2.6 * rnd(), 4.0 + 5.0 * rnd()),
+                    log_scale: DVec3::splat((0.01_f64).ln()),
+                    opacity: 0.5,
+                    color: DVec3::new(rnd(), rnd(), rnd()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let _ = r.set_gaussians(&big);
+        let rendered = r.render_sorted(&camera(), &params, 1);
+        let pass = match (rendered, r.read_sorted().await) {
+            (Ok(()), Some((keys, vals))) => {
+                let sorted = keys.windows(2).all(|w| w[0] <= w[1]);
+                let mut seen = vec![false; vals.len()];
+                let perm = vals.iter().all(|&v| (v as usize) < seen.len() && !std::mem::replace(&mut seen[v as usize], true));
+                sorted && perm
+            }
+            _ => false,
+        };
+        log(format!("[radix sort 300k] ascending permutation through a 3-level scan: {}", if pass { "ok" } else { "FAIL" }));
+        ok &= pass;
+    }
+
+    // demand probe vs the GPS path's own generated points
+    {
+        let gg: Vec<_> = crowd.iter().map(GpuGaussian::from_oracle).collect();
+        let _ = r.set_gaussians(&gg);
+        let p = RenderParams { max_points_per_splat: 1 << 24, ..params };
+        r.reset_accum();
+        r.reset_stats();
+        let _ = r.probe_demand(&camera(), &p);
+        let probe = r.read_stats().await.probe_demand as f64;
+        r.reset_stats();
+        let sets = 40;
+        let mut done = 0;
+        while done < sets {
+            let n = (sets - done).min(MAX_ENSEMBLES_PER_SUBMIT);
+            let _ = r.render_ensembles(&camera(), &p, 1 + done, n);
+            done += n;
+        }
+        let points = r.read_stats().await.points as f64 / sets as f64;
+        let rel = (probe - points).abs() / points.max(1.0);
+        let pass = points > 1000.0 && rel < 0.02;
+        log(format!("[demand probe] probe={probe:.0} GPS mean points/ensemble={points:.0} (rel {rel:.4}): {}", if pass { "ok" } else { "FAIL" }));
+        ok &= pass;
+    }
+
+    // resolution change reallocates the sorted buffers
+    {
+        let _ = r.resize(64, 64, SPP_SIDE);
+        let gg: Vec<_> = crowd.iter().map(GpuGaussian::from_oracle).collect();
+        let _ = r.set_gaussians(&gg);
+        let pass = r.render_sorted(&camera(), &params, 1).is_ok() && r.read_accum().await.len() == 64 * 64;
+        log(format!("[resize] sorted path after resize to 64x64: {}", if pass { "ok" } else { "FAIL" }));
+        ok &= pass;
+    }
+    log(if ok { "PHASE5: PASS".into() } else { "PHASE5: FAIL".into() });
+    ok
+}

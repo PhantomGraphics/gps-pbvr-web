@@ -11,6 +11,7 @@ use gps_core::{ordered_depth_key, pcg_hash};
 use wgpu::util::DeviceExt;
 
 pub mod gps;
+mod sorted;
 pub mod verify;
 
 const SAMPLE_WGSL: &str = include_str!("../../../shaders/p0_sample.wgsl");
