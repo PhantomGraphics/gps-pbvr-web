@@ -107,6 +107,11 @@ pub struct Viewer {
     effective_per_frame: u32,
     lod_n: u32,
     lod_quiet: u32,
+    /// points-per-ensemble budget (0 = off) and the automatic density factor that enforces it
+    point_budget: f64,
+    auto_density: f32,
+    /// frames since the history last restarted (the stats readback lags by a few frames)
+    frames_since_reset: u32,
     /// monotonic counters for the page's frame-time statistics (see `ensemble_counter`/`history_epoch`)
     ensemble_counter: u32,
     history_epoch: u32,
@@ -176,6 +181,9 @@ impl Viewer {
             effective_per_frame: 1,
             lod_n: 1,
             lod_quiet: 0,
+            point_budget: 0.0,
+            auto_density: 1.0,
+            frames_since_reset: 0,
             ensemble_counter: 0,
             history_epoch: 0,
             moving_cap: 2048,
@@ -376,6 +384,18 @@ impl Viewer {
         self.invalidate();
     }
 
+    /// Per-ensemble point budget in millions (0 = off). When the view would need more points (zooming in makes every
+    /// splat cover more pixels), the density is lowered automatically to stay within the budget. The mean image is
+    /// unchanged; only the sampling noise rises, which more accumulated ensembles average out.
+    pub fn set_point_budget(&mut self, millions: f64) {
+        let b = if millions.is_finite() { millions.max(0.0) * 1.0e6 } else { 0.0 };
+        if b != self.point_budget {
+            self.point_budget = b;
+            self.auto_density = 1.0;
+            self.invalidate();
+        }
+    }
+
     pub fn orbit(&mut self, dx: f64, dy: f64) {
         self.last_input_ms = self.last_frame_ms;
         self.cam.orbit(-dx * 0.005, dy * 0.005);
@@ -422,6 +442,7 @@ impl Viewer {
             self.renderer.reset_accum();
             self.renderer.reset_stats();
             self.history_epoch = self.history_epoch.wrapping_add(1);
+            self.frames_since_reset = 0;
             self.next_seed = self.seed;
             self.dirty = false;
             self.needs_present = true;
@@ -433,6 +454,23 @@ impl Viewer {
             self.renderer.request_stats();
         }
         let acc = self.renderer.accumulated();
+        // Budget control: demand = points an ensemble would need at density factor 1, measured from the
+        // GPU counters of the current history window (reset on every change, so the measure is fresh).
+        self.frames_since_reset = self.frames_since_reset.saturating_add(1);
+        // wait until a stats readback of the CURRENT window has certainly arrived, or stale counters would flip-flop the factor
+        if self.point_budget > 0.0 && !self.lod_moving && self.frames_since_reset >= 8 && self.renderer.latest_stats().ensembles >= 2 {
+            // Truncated splats drop part of their demand (`dropped_points`); count it, or a view dominated by huge
+            // splats would look cheap while its image is biased dark.
+            let st = self.renderer.latest_stats();
+            let demand = (st.points + st.dropped_points) as f64 / st.ensembles as f64 / self.auto_density as f64;
+            if demand > 0.0 {
+                let want = (self.point_budget / demand).clamp(0.1, 1.0) as f32;
+                if (want / self.auto_density).ln().abs() > 0.25 {
+                    self.auto_density = want;
+                    self.invalidate();
+                }
+            }
+        }
         let stalled = acc == 0 && self.renderer.submitted() >= 8;
         if acc < self.target && !stalled {
             let moving = now_ms - self.last_input_ms < 250.0;
@@ -462,6 +500,7 @@ impl Viewer {
             let n = want.min(self.target - acc);
             let cam = self.cam.to_camera(self.width, self.height);
             let mut p = self.params;
+            p.density_scale *= self.auto_density;
             if self.lod_moving {
                 p.max_points_per_splat = p.max_points_per_splat.min(self.moving_cap);
             }
@@ -520,7 +559,7 @@ impl Viewer {
         let s = self.renderer.latest_stats();
         let m = estimate_memory(self.width, self.height, self.params.spp_side, self.renderer.gaussian_count() as usize);
         format!(
-            "{{\"scene\":\"{}\",\"gaussians\":{},\"width\":{},\"height\":{},\"spp\":{},\"accumulated\":{},\"target\":{},\"points\":{},\"visible\":{},\"truncated_splats\":{},\"dropped_points\":{},\"seed\":{},\"lod_moving\":{},\"ensembles_per_frame\":{},\"sh_max\":{},\"sh_degree\":{},\"orphan\":{},\"candidates\":{},\"undercovered\":{},\"skipped\":{},\"method\":\"{}\",\"memory_mib\":{:.1},\"yaw\":{:.4},\"pitch\":{:.4},\"distance\":{:.4}}}",
+            "{{\"scene\":\"{}\",\"gaussians\":{},\"width\":{},\"height\":{},\"spp\":{},\"accumulated\":{},\"target\":{},\"points\":{},\"visible\":{},\"truncated_splats\":{},\"dropped_points\":{},\"seed\":{},\"lod_moving\":{},\"ensembles_per_frame\":{},\"sh_max\":{},\"sh_degree\":{},\"orphan\":{},\"candidates\":{},\"undercovered\":{},\"skipped\":{},\"density_auto\":{:.3},\"method\":\"{}\",\"memory_mib\":{:.1},\"yaw\":{:.4},\"pitch\":{:.4},\"distance\":{:.4}}}",
             self.scene_info.replace('"', "'"),
             self.renderer.gaussian_count(),
             self.width,
@@ -541,6 +580,7 @@ impl Viewer {
             s.candidates,
             s.undercovered_splats,
             s.skipped_ensembles,
+            self.auto_density,
             self.params.method.name(),
             (m.total() + self.renderer.sh_bytes()) as f64 / 1048576.0,
             self.cam.yaw,

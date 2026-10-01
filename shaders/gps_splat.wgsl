@@ -39,6 +39,7 @@ struct Frame {
 //        4 = orphan subpixels (depth written but no colour winner: pass divergence, must be 0),
 //        5 = candidate particles (PBVR, before keep tests), 6 = under-covered splats (ViewConditioned),
 //        7 = ensembles skipped because the particle total would overflow u32 (cumulative),
+//        10 = ensembles started (counted in clear_buffers; lets the CPU normalise the counters it reads back),
 //        16..22 = high words of counters 0..6 (stat_add carries into stats[16 + k]; see GpuStats::from_words),
 //        8 = running particle total of the current ensemble, 9 = overflow flag of the current ensemble (both cleared by clear_buffers)
 
@@ -280,6 +281,17 @@ fn emit_particle(gid: u32, mode: u32, mean: vec2<f32>, depth_z: f32, o: f32, l00
     }
 }
 
+// A particle lies at most OFFSCREEN_SIGMA whitened radii from the splat mean (the radius law is capped at
+// sqrt(2 * 17) = 5.83: the LUT clamps -ln(1-u) at 17), so |dx| <= R sqrt(a) and |dy| <= R sqrt(c). A splat whose
+// box misses the image can never write a pixel: skipping it changes no pixel, only the (otherwise wasted) work.
+const OFFSCREEN_SIGMA: f32 = 5.9;
+fn offscreen(pr: Proj) -> bool {
+    let ex = OFFSCREEN_SIGMA * sqrt(pr.a);
+    let ey = OFFSCREEN_SIGMA * sqrt(pr.c);
+    return pr.mean.x + ex < 0.0 || pr.mean.x - ex >= f32(frame.dims.x)
+        || pr.mean.y + ey < 0.0 || pr.mean.y - ey >= f32(frame.dims.y);
+}
+
 // Expected particle count of a projected splat (before Poisson).
 fn expected_count(pr: Proj, o: f32) -> f32 {
     let spp = frame.dims.z * frame.dims.z;
@@ -294,6 +306,7 @@ fn splat_pass(gid: u32, mode: u32) {
     if (!pr.ok) { return; }
     let o = clamp(splats[gid * 4u].w, 0.0, 1.0);
     if (o <= 0.0) { return; }
+    if (offscreen(pr)) { return; }
     let en = expected_count(pr, o);
     if (!(en > 0.0)) { return; }
 
@@ -324,6 +337,7 @@ fn clear_buffers(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = thread_index(gid, frame.cfg.w);
     if (i == 0u) {
         atomicStore(&stats[8], 0u);
+        atomicAdd(&stats[10], 1u);
         atomicStore(&stats[9], 0u);
     }
     if (i < frame.dims.x * frame.dims.y * frame.dims.z * frame.dims.z) {
@@ -519,6 +533,7 @@ fn emit_particle_pbvr(gid: u32, mode: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f
 
 // ---------------------------------------------------------------- particle-parallel path
 fn prepare_gps(i: u32, pr: Proj, o: f32) -> u32 {
+    if (offscreen(pr)) { return 0u; }
     let en = expected_count(pr, o);
     if (!(en > 0.0)) { return 0u; }
     rng_state = particle_seed(i, 0u, frame.cfg.x);

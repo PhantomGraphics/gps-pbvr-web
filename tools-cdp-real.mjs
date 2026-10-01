@@ -58,6 +58,7 @@ try {
   const waitAcc = async (n) => { for (let i = 0; i < 1200; i++) { const t = await stat(); if (accOf(t) >= n) return t; await sleep(500); } return await stat(); };
   const set = (id, v) => ev("(() => { const e = document.getElementById('" + id + "'); if (e.type === 'checkbox') e.checked = " + JSON.stringify(v) + "; else e.value = " + JSON.stringify(String(v)) + "; e.dispatchEvent(new Event('change')); })()");
   await set('target', 64);
+  if (process.env.RES) await set('res', process.env.RES);   // e.g. 1280x720
   if (process.env.LOD) await set('lod', 'adaptive');
   console.log(await ev(`(async () => {
     const t0 = performance.now();
@@ -68,6 +69,10 @@ try {
   })()`));
   const yd = process.env.YDOWN;
   if (yd !== undefined) await set('ydown', yd === '1');
+  console.log('camera: ' + await ev(`JSON.stringify(window.__gps.getSession().camera)`));
+  if (process.env.CAM) {   // JSON overrides of the orbit camera, e.g. {"distance":0.5,"yaw":1.2}
+    console.log('camera override: ' + await ev(`(() => { const s = window.__gps.getSession(); Object.assign(s.camera, ${process.env.CAM}); window.__gps.applySession(s); return JSON.stringify(s.camera); })()`));
+  }
   if (process.env.MOTION) {
     // Orbit with pointer events for ~3 s and record the frame intervals (moving), then wait for convergence (still).
     const measure = (ms) => ev(`(async () => { const c = document.getElementById('cv'); const r = c.getBoundingClientRect(); const x = r.left + r.width / 2, y = r.top + r.height / 2;
@@ -92,6 +97,7 @@ try {
     writeFileSync(file, Buffer.from((await send('Page.captureScreenshot', { format: 'png' })).result.data, 'base64'));
     console.log('--- ' + name + '\n' + t + '\n -> ' + file);
     if (/内部不整合|打切り/.test(t)) bad = true;
+    if (process.env.FIRST_ONLY) break;
   }
   code = bad || exceptions > 0 ? 1 : 0;
   ws.close();

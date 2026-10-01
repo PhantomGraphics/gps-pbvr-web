@@ -93,6 +93,9 @@ impl OracleCamera {
 /// Row-major, `w * h` linear-RGB pixels.
 pub type Image = Vec<DVec3>;
 
+/// Bound (in whitened radii) on how far a GPS particle can land from its splat mean; see the GPU `offscreen()`.
+pub const OFFSCREEN_SIGMA: f64 = 5.9;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RenderStats {
     pub points: f64,
@@ -268,6 +271,13 @@ pub fn render_monte_carlo(
             let en = footprint_point_count(expected_point_count(pr.det, pr.opacity) * spp as f64 * opt.density_scale, fp);
             if en <= 0.0 {
                 continue;
+            }
+            // mirrors the GPU's exact off-screen skip (no pixel could be written)
+            if fp == 1 {
+                let (ex, ey) = (OFFSCREEN_SIGMA * sample_cov[gid].x_axis.x.sqrt(), OFFSCREEN_SIGMA * sample_cov[gid].y_axis.y.sqrt());
+                if pr.mean.x + ex < 0.0 || pr.mean.x - ex >= w as f64 || pr.mean.y + ey < 0.0 || pr.mean.y - ey >= h as f64 {
+                    continue;
+                }
             }
             let seed = particle_seed(SeedMode::FrameVarying, gid as u32, 0, base_seed.wrapping_add(s as u32));
             let mut rng = RandStream::new(seed);

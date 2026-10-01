@@ -73,6 +73,7 @@
       <details><summary>詳細設定</summary>
         <label>ensemble / フレーム <input type="number" id="perframe" min="1" max="4" value="1"></label>
         <label>粒子上限 / splat <input type="number" id="maxpts" min="64" max="16777216" value="16384"></label>
+        <label>点数予算 (百万点 / ensemble, 0=無効。⚠密度を下げるため画像が薄くなります) <input type="number" id="budget" min="0" max="1000" step="1" value="0"></label>
         <label>移動中の粒子上限（適応LOD） <input type="number" id="movecap" min="64" max="1048576" value="2048"></label>
       </details>
     </section>
@@ -237,18 +238,19 @@
     viewer.set_sh_degree(+$('sh').value);
   };
   const applySh = () => viewer.set_sh_degree(+$('sh').value);
-  const applyLod = () => { viewer.set_lod($('lod').value === 'adaptive', 33.3, +$('movecap').value); $('perframe').disabled = $('lod').value === 'adaptive'; };
+  const applyLod = () => { viewer.set_lod($('lod').value === 'adaptive', 33.3, +$('movecap').value); viewer.set_point_budget(+$('budget').value); $('perframe').disabled = $('lod').value === 'adaptive'; };
   const applySeed = () => viewer.set_seed(Math.max(0, Math.floor(+$('seed').value || 0)) >>> 0);
   for (const id of ['method', 'calib', 'radial', 'centre', 'jitter', 'basek', 'reflen']) $(id).addEventListener('change', () => applyMethod());
   $('sh').addEventListener('change', () => applySh());
   $('lod').addEventListener('change', () => applyLod());
   $('seed').addEventListener('change', () => applySeed());
   $('movecap').addEventListener('change', () => applyLod());
+  $('budget').addEventListener('change', () => applyLod());
   $('ydown').addEventListener('change', () => viewer.set_y_down($('ydown').checked));
   $('reset').onclick = () => viewer.reset_view();   // camera back to the load-time framing + restart accumulation
 
   // ------------------------------------------------------------------ session (reproducible state)
-  const SETTING_IDS = ['preset', 'res', 'spp', 'density', 'target', 'perframe', 'maxpts', 'movecap', 'sh', 'lod', 'seed', 'method', 'calib', 'basek', 'reflen'];
+  const SETTING_IDS = ['preset', 'res', 'spp', 'density', 'target', 'perframe', 'maxpts', 'movecap', 'budget', 'sh', 'lod', 'seed', 'method', 'calib', 'basek', 'reflen'];
   const CHECK_IDS = ['radial', 'centre', 'jitter', 'ydown'];
   const getSession = () => {
     const settings = {};
@@ -536,7 +538,7 @@ SH ${s.sh_degree}/${s.sh_max}  ensemble/フレーム ${s.ensembles_per_frame}  s
 ⚠ 粒子総数が 32bit を超えたため ${s.skipped} ensemble を省略しました（粒子上限/密度を下げてください）`;
     if (s.orphan > 0) t += `\n⚠ 内部不整合 ${s.orphan}`;
     $('stats').textContent = t;
-    $('hud').textContent = `${s.method} · ${s.width}x${s.height} · 累積 ${s.accumulated}/${s.target} · p50 ${p(0.5)}ms${s.lod_moving ? ' · 移動中' : ''}${s.truncated_splats > 0 && !s.lod_moving ? ' · ⚠打切り' : ''}`;
+    $('hud').textContent = `${s.method} · ${s.width}x${s.height} · 累積 ${s.accumulated}/${s.target} · p50 ${p(0.5)}ms${s.density_auto < 0.999 ? ` · 密度自動 ×${s.density_auto.toFixed(2)}` : ''}${s.lod_moving ? ' · 移動中' : ''}${s.truncated_splats > 0 && !s.lod_moving ? ' · ⚠打切り' : ''}`;
   }, 500);
 </script>
 </body>

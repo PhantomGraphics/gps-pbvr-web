@@ -235,6 +235,8 @@ pub struct GpuStats {
     pub undercovered_splats: u64,
     /// ensembles skipped because their particle total exceeded u32 (lower the per-splat cap / density)
     pub skipped_ensembles: u64,
+    /// ensembles the GPU has started in this counter window (the readback lags submissions)
+    pub ensembles: u64,
 }
 
 impl GpuStats {
@@ -250,6 +252,7 @@ impl GpuStats {
             candidates: c(5),
             undercovered_splats: c(6),
             skipped_ensembles: w[7] as u64,
+            ensembles: w[10] as u64,
         }
     }
 }
