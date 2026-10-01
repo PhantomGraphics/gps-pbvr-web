@@ -192,6 +192,9 @@ pub struct RenderParams {
     pub near: f32,
     pub background: [f32; 3],
     pub exposure: f32,
+    /// apply the sRGB OETF when presenting (colours are linear, the C++ reference convention). Off shows the
+    /// stored colour values as they are, which is how 3DGS viewers display trained data.
+    pub srgb_output: bool,
     /// evaluate the corrected radius exactly per point (the reference) instead of through the table
     pub exact_radius: bool,
     /// active SH degree 0..=3 (clamped to what the loaded scene provides)
@@ -211,6 +214,7 @@ impl Default for RenderParams {
             near: 0.05,
             background: [0.05, 0.05, 0.08],
             exposure: 1.0,
+            srgb_output: true,
             sh_degree: 3,
             exact_radius: false,
             path: RenderPath::Particle,
@@ -957,7 +961,7 @@ impl GpsRenderer {
     /// Records the composite pass into `view`, which must have this renderer's target format
     /// and the internal resolution.
     pub fn composite(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, params: &RenderParams) {
-        let cu = CompositeUniform { width: self.width, height: self.height, exposure: params.exposure, gamma_on: 1 };
+        let cu = CompositeUniform { width: self.width, height: self.height, exposure: params.exposure, gamma_on: params.srgb_output as u32 };
         self.queue.write_buffer(&self.composite_uniform, 0, bytemuck::bytes_of(&cu));
         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("gps composite"),

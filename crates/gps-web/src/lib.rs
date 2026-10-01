@@ -450,6 +450,13 @@ impl Viewer {
         }
     }
 
+    /// Presentation only (no history reset): true = apply the sRGB OETF to the linear colours (default, the C++
+    /// reference convention), false = show the stored colour values unchanged (how 3DGS viewers display PLY data).
+    pub fn set_srgb_output(&mut self, on: bool) {
+        self.params.srgb_output = on;
+        self.needs_present = true;
+    }
+
     pub fn orbit(&mut self, dx: f64, dy: f64) {
         self.last_input_ms = self.last_frame_ms;
         self.cam.orbit(-dx * 0.005, dy * 0.005);

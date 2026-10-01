@@ -58,6 +58,7 @@ try {
   const waitAcc = async (n) => { for (let i = 0; i < 1200; i++) { const t = await stat(); if (accOf(t) >= n) return t; await sleep(500); } return await stat(); };
   const set = (id, v) => ev("(() => { const e = document.getElementById('" + id + "'); if (e.type === 'checkbox') e.checked = " + JSON.stringify(v) + "; else e.value = " + JSON.stringify(String(v)) + "; e.dispatchEvent(new Event('change')); })()");
   await set('target', 64);
+  if (process.env.GAMMA) await set('gamma', process.env.GAMMA === '1');   // 0 = show colour values unchanged
   if (process.env.PATHMODE) await set('pathmode', process.env.PATHMODE);   // 0 GPS, 1 sorted, 2 auto
   if (process.env.RES) await set('res', process.env.RES);   // e.g. 1280x720
   if (process.env.LOD) await set('lod', 'adaptive');
@@ -73,6 +74,16 @@ try {
   console.log('camera: ' + await ev(`JSON.stringify(window.__gps.getSession().camera)`));
   if (process.env.CAM) {   // JSON overrides of the orbit camera, e.g. {"distance":0.5,"yaw":1.2}
     console.log('camera override: ' + await ev(`(() => { const s = window.__gps.getSession(); Object.assign(s.camera, ${process.env.CAM}); window.__gps.applySession(s); return JSON.stringify(s.camera); })()`));
+  }
+  if (process.env.CAMS) {   // JSON array of camera overrides: one screenshot per entry (out-camN.png), then exit
+    const list = JSON.parse(process.env.CAMS);
+    for (let i = 0; i < list.length; i++) {
+      await ev(`(() => { const s = window.__gps.getSession(); Object.assign(s.camera, ${JSON.stringify(list[i])}); window.__gps.applySession(s); })()`);
+      await sleep(600); const t = await waitAcc(64);
+      writeFileSync(out + '-cam' + i + '.png', Buffer.from((await send('Page.captureScreenshot', { format: 'png' })).result.data, 'base64'));
+      console.log('cam ' + i + ' ' + JSON.stringify(list[i]) + ' | ' + t.split(String.fromCharCode(10)).filter((l) => /描画経路/.test(l)).join(''));
+    }
+    ws.close(); child.kill(); srv.close(); process.exit(0);
   }
   if (process.env.MOTION) {
     // Orbit with pointer events for ~3 s and record the frame intervals (moving), then wait for convergence (still).
