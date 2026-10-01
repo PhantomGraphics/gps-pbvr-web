@@ -262,7 +262,7 @@ impl MemoryEstimate {
 
 pub fn estimate_memory(width: u32, height: u32, spp_side: u32, n_splats: usize) -> MemoryEstimate {
     let sub = width as u64 * height as u64 * (spp_side * spp_side) as u64;
-    MemoryEstimate { depth_winner_bytes: 8 * sub, accum_bytes: 16 * width as u64 * height as u64, splat_bytes: 100 * n_splats as u64 }
+    MemoryEstimate { depth_winner_bytes: 8 * sub, accum_bytes: 16 * width as u64 * height as u64, splat_bytes: 132 * n_splats as u64 }
 }
 
 /// (groups_x, groups_y, stride in threads) covering `n` threads with 64-thread groups, staying
@@ -610,6 +610,10 @@ impl GpsRenderer {
     }
     pub fn spp_side(&self) -> u32 {
         self.spp_side
+    }
+    /// GPU bytes used by the SH bands of the loaded scene (0 without SH).
+    pub fn sh_bytes(&self) -> u64 {
+        self.n_splats as u64 * 3 * self.sh_stride as u64 * 4
     }
     /// Highest SH degree the loaded scene provides (0 = SH0 only).
     pub fn sh_max_degree(&self) -> u32 {

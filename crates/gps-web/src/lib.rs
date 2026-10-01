@@ -246,11 +246,18 @@ impl Viewer {
     }
 
     fn frame_scene(&mut self, g: &[GpuGaussian], y_down: bool) {
-        let n = g.len() as f64;
-        let c = g.iter().fold(DVec3::ZERO, |a, p| a + DVec3::new(p.pos_opacity[0] as f64, p.pos_opacity[1] as f64, p.pos_opacity[2] as f64)) / n;
-        let mut d: Vec<f64> = g.iter().map(|p| (DVec3::new(p.pos_opacity[0] as f64, p.pos_opacity[1] as f64, p.pos_opacity[2] as f64) - c).length()).collect();
+        // Robust framing: per-axis median as the centre and the 75th percentile of the distance to it as the
+        // radius, because real captures carry far background Gaussians / floaters that dominate a mean or 90th percentile.
+        let pos = |p: &GpuGaussian| DVec3::new(p.pos_opacity[0] as f64, p.pos_opacity[1] as f64, p.pos_opacity[2] as f64);
+        let median = |axis: usize| {
+            let mut v: Vec<f64> = g.iter().map(|p| pos(p)[axis]).collect();
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        let c = DVec3::new(median(0), median(1), median(2));
+        let mut d: Vec<f64> = g.iter().map(|p| (pos(p) - c).length()).collect();
         d.sort_by(|a, b| a.total_cmp(b));
-        let radius = d[((d.len() as f64 * 0.9) as usize).min(d.len() - 1)]; // robust to outliers
+        let radius = d[((d.len() as f64 * 0.75) as usize).min(d.len() - 1)];
         self.cam = OrbitCamera { up: if y_down { -DVec3::Y } else { DVec3::Y }, pitch: 0.25, yaw: 0.6, ..Default::default() };
         self.cam.frame_sphere(c, radius.max(1e-3));
         self.home_cam = self.cam;
@@ -491,7 +498,7 @@ impl Viewer {
             s.candidates,
             s.undercovered_splats,
             self.params.method.name(),
-            m.total() as f64 / 1048576.0,
+            (m.total() + self.renderer.sh_bytes()) as f64 / 1048576.0,
             self.cam.yaw,
             self.cam.pitch,
             self.cam.distance

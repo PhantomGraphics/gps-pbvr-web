@@ -14,6 +14,7 @@ const [exe, out, ...extra] = process.argv.slice(2);
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm' };
 const srv = createServer((req, res) => {
   const u = decodeURIComponent(req.url.split('?')[0]);
+  if (u === '/__real') { res.writeHead(200, { 'content-type': 'application/octet-stream' }); return res.end(readFileSync(process.env.REAL)); }
   const f = u.startsWith('/fixtures/') ? join(root, 'tests', normalize(u)) : join(root, 'web', normalize(u === '/' ? '/index.html' : u));
   if (!existsSync(f)) { res.writeHead(404); return res.end(); }
   res.writeHead(200, { 'content-type': types[extname(f)] || 'application/octet-stream' });
@@ -52,20 +53,18 @@ try {
   await send('Page.navigate', { url: `http://127.0.0.1:${sport}/index.html` });
   for (let i = 0; i < 60 && !(await ev(`!!document.getElementById('stats')?.textContent.includes('累積')`)); i++) await sleep(500);
   // the light preset is the default; the check runs with it
-  const real = process.env.REAL;
-  const b64 = readFileSync(real).toString('base64');
   const stat = () => ev(`document.getElementById('stats').textContent`);
   const accOf = (t) => { const m = /累積 (\d+)\//.exec(t); return m ? +m[1] : -1; };
-  const waitAcc = async (n) => { for (let i = 0; i < 240; i++) { const t = await stat(); if (accOf(t) >= n) return t; await sleep(500); } return await stat(); };
+  const waitAcc = async (n) => { for (let i = 0; i < 1200; i++) { const t = await stat(); if (accOf(t) >= n) return t; await sleep(500); } return await stat(); };
   const set = (id, v) => ev("(() => { const e = document.getElementById('" + id + "'); if (e.type === 'checkbox') e.checked = " + JSON.stringify(v) + "; else e.value = " + JSON.stringify(String(v)) + "; e.dispatchEvent(new Event('change')); })()");
   await set('target', 64);
   if (process.env.LOD) await set('lod', 'adaptive');
   console.log(await ev(`(async () => {
-    const bin = atob('${b64}'); const b = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i);
-    const dt = new DataTransfer(); dt.items.add(new File([b], 'real.ply'));
-    const i = document.getElementById('file'); i.files = dt.files; i.dispatchEvent(new Event('change'));
-    await new Promise((r) => setTimeout(r, 1500));
-    return 'msg: ' + document.getElementById('msg').textContent + ' | sh=' + document.getElementById('sh').value;
+    const t0 = performance.now();
+    const b = new Uint8Array(await (await fetch('/__real')).arrayBuffer());
+    const t1 = performance.now();
+    await window.__gps.loadBytes(new File([b], 'real.ply'));
+    return 'fetch ' + Math.round(t1 - t0) + ' ms, parse+upload ' + Math.round(performance.now() - t1) + ' ms | msg: ' + document.getElementById('msg').textContent + ' | sh=' + document.getElementById('sh').value;
   })()`));
   const yd = process.env.YDOWN;
   if (yd !== undefined) await set('ydown', yd === '1');
