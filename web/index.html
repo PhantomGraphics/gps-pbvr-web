@@ -283,6 +283,10 @@
     cv.addEventListener('pointerup', end);
     cv.addEventListener('pointercancel', end);
     cv.addEventListener('pointermove', (e) => {
+      // Some input paths (automation, a press that started elsewhere, a lost capture) deliver moves with a button
+      // held but no pointerdown: treat the first such move as the start of a drag instead of ignoring the drag.
+      if (!pts.has(e.pointerId) && e.buttons !== 0) pts.set(e.pointerId, [e.clientX, e.clientY]);
+      if (e.buttons === 0 && e.pointerType === 'mouse') { pts.delete(e.pointerId); return; }   // button released outside: stop
       const prev = pts.get(e.pointerId);
       if (!prev || busy) return;
       const dx = e.clientX - prev[0], dy = e.clientY - prev[1];
