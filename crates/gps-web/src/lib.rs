@@ -107,6 +107,9 @@ pub struct Viewer {
     effective_per_frame: u32,
     lod_n: u32,
     lod_quiet: u32,
+    /// monotonic counters for the page's frame-time statistics (see `ensemble_counter`/`history_epoch`)
+    ensemble_counter: u32,
+    history_epoch: u32,
     /// Adaptive LOD: per-splat particle cap used while the camera moves (the full cap applies once still)
     moving_cap: u32,
     lod_moving: bool,
@@ -173,6 +176,8 @@ impl Viewer {
             effective_per_frame: 1,
             lod_n: 1,
             lod_quiet: 0,
+            ensemble_counter: 0,
+            history_epoch: 0,
             moving_cap: 2048,
             lod_moving: false,
             dirty: true,
@@ -416,12 +421,20 @@ impl Viewer {
         if self.dirty {
             self.renderer.reset_accum();
             self.renderer.reset_stats();
+            self.history_epoch = self.history_epoch.wrapping_add(1);
             self.next_seed = self.seed;
             self.dirty = false;
             self.needs_present = true;
         }
+        // The valid count needs the skip counter; keep the (non-blocking, one-in-flight) readback going
+        // while converging. If every ensemble so far overflowed u32 (a deterministic property of the
+        // view/settings), stop submitting more of them: the UI reports the skipped count.
+        if self.renderer.submitted() <= self.target + 8 {
+            self.renderer.request_stats();
+        }
         let acc = self.renderer.accumulated();
-        if acc < self.target {
+        let stalled = acc == 0 && self.renderer.submitted() >= 8;
+        if acc < self.target && !stalled {
             let moving = now_ms - self.last_input_ms < 250.0;
             if moving {
                 self.lod_n = 1;
@@ -454,6 +467,7 @@ impl Viewer {
             }
             self.renderer.render_ensembles(&cam, &p, self.next_seed, n).map_err(js_err)?;
             self.next_seed = self.next_seed.wrapping_add(n);
+            self.ensemble_counter = self.ensemble_counter.wrapping_add(n);
             self.needs_present = true;
         }
         if !self.needs_present {
@@ -480,6 +494,17 @@ impl Viewer {
     /// because a WebGPU canvas can only be read in the task that presented it).
     pub fn redraw(&mut self) {
         self.needs_present = true;
+    }
+
+    /// Total ensembles submitted over the viewer's lifetime (wrapping). A change between two frames
+    /// means that frame did render work, as opposed to idling on a converged image.
+    pub fn ensemble_counter(&self) -> u32 {
+        self.ensemble_counter
+    }
+
+    /// Bumps whenever the history restarts (camera / data / parameter change).
+    pub fn history_epoch(&self) -> u32 {
+        self.history_epoch
     }
 
     pub fn accumulated(&self) -> u32 {

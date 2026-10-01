@@ -17,7 +17,7 @@ const SLOT: u64 = 256;
 /// Ensembles encoded per submission (one uniform slot each). Kept small on purpose: with 16-64 the
 /// command buffer of a 70k-splat scene made `finish()` fail with Out of Memory on an integrated GPU.
 pub const MAX_ENSEMBLES_PER_SUBMIT: u32 = 4;
-const STATS_WORDS: usize = 10;
+const STATS_WORDS: usize = 24;
 /// Scan levels: 256^5 > u32::MAX splats, so 6 slots are more than enough.
 const MAX_SCAN_LEVELS: usize = 6;
 /// Splat count limit of the particle path: every scan level dispatches < 65536 groups (256^3 = 16.7M).
@@ -239,14 +239,16 @@ pub struct GpuStats {
 
 impl GpuStats {
     fn from_words(w: &[u32]) -> Self {
+        // counters 0..=6 are 64-bit: low word at k, high (carry) word at 16 + k
+        let c = |k: usize| w[k] as u64 | (w[16 + k] as u64) << 32;
         Self {
-            points: w[0] as u64,
-            truncated_splats: w[1] as u64,
-            dropped_points: w[2] as u64,
-            visible_splats: w[3] as u64,
-            orphan_subpixels: w[4] as u64,
-            candidates: w[5] as u64,
-            undercovered_splats: w[6] as u64,
+            points: c(0),
+            truncated_splats: c(1),
+            dropped_points: c(2),
+            visible_splats: c(3),
+            orphan_subpixels: c(4),
+            candidates: c(5),
+            undercovered_splats: c(6),
             skipped_ensembles: w[7] as u64,
         }
     }
@@ -314,7 +316,7 @@ pub struct GpsRenderer {
     composite_uniform: wgpu::Buffer,
     bind_groups: Vec<wgpu::BindGroup>,
     composite_bg: wgpu::BindGroup,
-    /// ensembles accumulated since the last reset (mirrors accum.w)
+    /// ensembles submitted since the last reset (valid count = this minus skipped, see `accumulated()`)
     accumulated: u32,
     /// non-blocking stats readback (one request in flight at a time)
     // particle-parallel path
@@ -640,8 +642,15 @@ impl GpsRenderer {
     pub fn gaussian_count(&self) -> u32 {
         self.n_splats
     }
-    pub fn accumulated(&self) -> u32 {
+    /// Ensembles submitted since the last reset, including any the GPU skipped.
+    pub fn submitted(&self) -> u32 {
         self.accumulated
+    }
+
+    /// Valid ensembles in the history: submitted minus those the GPU skipped on u32 particle-total
+    /// overflow (they add nothing to `accum`). The skip count arrives with the async stats readback.
+    pub fn accumulated(&self) -> u32 {
+        self.accumulated.saturating_sub(self.latest_stats().skipped_ensembles.min(u32::MAX as u64) as u32)
     }
     pub fn target_format(&self) -> wgpu::TextureFormat {
         self.target_format
@@ -761,6 +770,11 @@ impl GpsRenderer {
         let zeros = vec![0u8; self.width as usize * self.height as usize * 16];
         self.queue.write_buffer(&self.accum, 0, &zeros);
         self.accumulated = 0;
+        // the skip counter belongs to the history window: restart it with the history
+        self.queue.write_buffer(&self.stats, 7 * 4, &[0u8; 4]);
+        if let Ok(mut g) = self.stats_latest.lock() {
+            g.skipped_ensembles = 0;
+        }
     }
 
     pub fn reset_stats(&self) {

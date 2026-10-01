@@ -39,7 +39,14 @@ struct Frame {
 //        4 = orphan subpixels (depth written but no colour winner: pass divergence, must be 0),
 //        5 = candidate particles (PBVR, before keep tests), 6 = under-covered splats (ViewConditioned),
 //        7 = ensembles skipped because the particle total would overflow u32 (cumulative),
+//        16..22 = high words of counters 0..6 (stat_add carries into stats[16 + k]; see GpuStats::from_words),
 //        8 = running particle total of the current ensemble, 9 = overflow flag of the current ensemble (both cleared by clear_buffers)
+
+// 64-bit counter k = (stats[16 + k] << 32) | stats[k]: add to the low word, carry into the high word on wrap.
+fn stat_add(k: u32, n: u32) {
+    let before = atomicAdd(&stats[k], n);
+    if (before + n < before) { atomicAdd(&stats[16u + k], 1u); }
+}
 
 const PI: f32 = 3.14159265358979;
 const DILOG_ONE: f32 = 1.64493406684823;
@@ -293,14 +300,14 @@ fn splat_pass(gid: u32, mode: u32) {
     rng_state = particle_seed(gid, 0u, frame.cfg.x);
     var n = poisson(en);
     if (mode == 0u) {
-        atomicAdd(&stats[0], n);
-        atomicAdd(&stats[3], 1u);
+        stat_add(0u, n);
+        stat_add(3u, 1u);
     }
     let cap = frame.cfg.y;
     if (n > cap) {
         if (mode == 0u) {
-            atomicAdd(&stats[1], 1u);
-            atomicAdd(&stats[2], n - cap);
+            stat_add(1u, 1u);
+            stat_add(2u, n - cap);
         }
         n = cap;
     }
@@ -339,6 +346,9 @@ fn color_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // An ensemble whose particle total overflowed u32 was skipped (zero particles): it must not add
+    // background samples to the history or count towards convergence. stats[9] is stable here.
+    if (atomicLoad(&stats[9]) != 0u) { return; }
     let i = thread_index(gid, frame.cfg2.x);
     let n_pix = frame.dims.x * frame.dims.y;
     if (i >= n_pix) { return; }
@@ -351,7 +361,7 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
         } else {
             let id = atomicLoad(&winner[i * spp + k]);
             if (id == EMPTY) {
-                atomicAdd(&stats[4], 1u);
+                stat_add(4u, 1u);
                 sum = sum + frame.bg.xyz;
             } else {
                 sum = sum + splat_colour(id, splats[id * 4u + 3u].xyz);
@@ -489,7 +499,7 @@ fn emit_particle_pbvr(gid: u32, mode: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f
     }
     var depth_z = cam.z;
     if ((flags & FLAG_CENTRE) != 0u) { depth_z = a.z; }
-    if (mode == 0u) { atomicAdd(&stats[0], 1u); }
+    if (mode == 0u) { stat_add(0u, 1u); }
     let W = frame.dims.x;
     let H = frame.dims.y;
     if (pix.x < 0.0 || pix.x >= f32(W) || pix.y < 0.0 || pix.y >= f32(H)) { return; }
@@ -513,12 +523,12 @@ fn prepare_gps(i: u32, pr: Proj, o: f32) -> u32 {
     if (!(en > 0.0)) { return 0u; }
     rng_state = particle_seed(i, 0u, frame.cfg.x);
     var n = poisson(en);
-    atomicAdd(&stats[0], n);
-    atomicAdd(&stats[3], 1u);
+    stat_add(0u, n);
+    stat_add(3u, 1u);
     let cap = frame.cfg.y;
     if (n > cap) {
-        atomicAdd(&stats[1], 1u);
-        atomicAdd(&stats[2], n - cap);
+        stat_add(1u, 1u);
+        stat_add(2u, n - cap);
         n = cap;
     }
     return n;
@@ -534,16 +544,16 @@ fn prepare_pbvr(i: u32, pr: Proj, o: f32) -> u32 {
         let spp = f32(frame.dims.z * frame.dims.z);
         let target_count = frame.prm.x * spp * 2.0 * PI * sqrt(det) * dilog(o);
         if (lambda > 0.5) { keep = clamp(target_count / lambda, 0.0, 1.0); } else { keep = 0.0; }
-        if (target_count > lambda) { atomicAdd(&stats[6], 1u); }
+        if (target_count > lambda) { stat_add(6u, 1u); }
     }
     rng_state = particle_seed(i, 0u, frame.cfg.x);
     var n = poisson(lambda);
-    atomicAdd(&stats[5], n);
-    atomicAdd(&stats[3], 1u);
+    stat_add(5u, n);
+    stat_add(3u, 1u);
     let cap = frame.cfg.y;
     if (n > cap) {
-        atomicAdd(&stats[1], 1u);
-        atomicAdd(&stats[2], n - cap);
+        stat_add(1u, 1u);
+        stat_add(2u, n - cap);
         n = cap;
     }
     let idet = 1.0 / max(det, 1e-30);

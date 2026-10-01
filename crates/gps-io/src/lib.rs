@@ -249,6 +249,13 @@ fn sh_degree_from_rest_count(n: usize) -> Result<usize, PlyError> {
     }
 }
 
+/// Allocate capacity fallibly so an allocation failure is an error, not an abort.
+fn try_vec<T>(n: usize) -> Result<Vec<T>, PlyError> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| PlyError::TooManyVertices(n))?;
+    Ok(v)
+}
+
 /// Parse a 3DGS PLY from memory. Validates counts, required attributes and finiteness.
 pub fn load_ply(bytes: &[u8]) -> Result<Gaussians, PlyError> {
     let h = parse_header(bytes)?;
@@ -268,23 +275,37 @@ pub fn load_ply(bytes: &[u8]) -> Result<Gaussians, PlyError> {
     let per_ch = gps_core::sh_rest_per_channel(sh_degree);
 
     let n = h.vertex_count;
-    let mut g = Gaussians {
-        count: n,
-        sh_degree,
-        position: Vec::with_capacity(n),
-        log_scale: Vec::with_capacity(n),
-        rot_wxyz: Vec::with_capacity(n),
-        opacity_logit: Vec::with_capacity(n),
-        f_dc: Vec::with_capacity(n),
-        sh_rest: Vec::with_capacity(n * 3 * per_ch),
-    };
-
     let body = &bytes[h.data_start..];
+    // Validate the body length against the declared count BEFORE allocating, so a short
+    // file declaring a huge (but <= MAX_VERTICES) count is rejected without a big allocation.
     if h.binary {
         let need = n.checked_mul(h.stride).ok_or(PlyError::TooManyVertices(n))?;
         if body.len() < need {
             return Err(PlyError::Truncated { expected: need, got: body.len() });
         }
+    } else {
+        // Every ASCII vertex needs >= 2 bytes per property (a digit plus a separator;
+        // the final separator may be missing).
+        let need = n
+            .checked_mul(h.props.len().max(1) * 2)
+            .ok_or(PlyError::TooManyVertices(n))?;
+        if body.len() + 1 < need {
+            return Err(PlyError::Truncated { expected: need - 1, got: body.len() });
+        }
+    }
+    let rest_len = n.checked_mul(3 * per_ch).ok_or(PlyError::TooManyVertices(n))?;
+    let mut g = Gaussians {
+        count: n,
+        sh_degree,
+        position: try_vec(n)?,
+        log_scale: try_vec(n)?,
+        rot_wxyz: try_vec(n)?,
+        opacity_logit: try_vec(n)?,
+        f_dc: try_vec(n)?,
+        sh_rest: try_vec(rest_len)?,
+    };
+
+    if h.binary {
         for v in 0..n {
             let rec = &body[v * h.stride..(v + 1) * h.stride];
             let get = |pi: usize| {
@@ -413,6 +434,16 @@ mod tests {
         assert!(load_ply(nan.as_bytes()).is_err());
         let missing = "ply\nformat ascii 1.0\nelement vertex 0\nproperty float x\nend_header\n";
         assert_eq!(load_ply(missing.as_bytes()).unwrap_err(), PlyError::MissingProperty("y"));
+    }
+
+    #[test]
+    fn huge_declared_count_rejected_before_allocation() {
+        for fmt in ["binary_little_endian", "ascii"] {
+            let mut b = header(fmt, MAX_VERTICES, false).into_bytes();
+            b.extend_from_slice(b"1 2 3
+");
+            assert!(matches!(load_ply(&b), Err(PlyError::Truncated { .. })), "{fmt}");
+        }
     }
 
     #[test]

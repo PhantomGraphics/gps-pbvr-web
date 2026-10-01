@@ -363,7 +363,13 @@
   bindCanvas();
 
   // ------------------------------------------------------------------ outputs: PNG / JSON / CSV
-  let ms = [];
+  let ms = [];                                   // rAF intervals of consecutive frames that submitted ensembles
+  const WARMUP_FRAMES = 5;
+  let msWarm = 0, prevActive = false, lastCounter = 0, lastEpoch = 0;
+  const frameMsStats = () => {
+    const q = (f) => { const a = [...ms].sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(f * a.length))] : null; };
+    return { kind: 'rAF interval of consecutive ensemble-rendering frames (not GPU time)', samples: ms.length, warmup_frames: WARMUP_FRAMES, p50: q(0.5), p95: q(0.95) };
+  };
   const methodTag = () => $('method').selectedOptions[0].text.split('（')[0].replace(/\s+/g, '_');
   const CSV_COLS = ['method', 'seed', 'accumulated', 'points', 'candidates', 'visible', 'truncated_splats', 'dropped_points', 'orphan', 'undercovered', 'width', 'height', 'spp', 'yaw', 'pitch', 'distance'];
   const csvRow = (s, extra = []) => [...extra, ...CSV_COLS.map((k) => String(s[k]).replace(/[",\n]/g, ' '))].join(',');
@@ -378,7 +384,7 @@
   $('savestats').onclick = async () => {
     const s = await freshStats();
     s.session = getSession();
-    s.frame_ms = { p50: [...ms].sort((a, b) => a - b)[Math.floor(ms.length * 0.5)] ?? null };
+    s.frame_ms = frameMsStats();
     download(new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' }), `stats_${methodTag()}_${s.accumulated}spf.json`);
   };
   $('savecsv').onclick = async () => {
@@ -490,7 +496,14 @@
       if (lost) reinit(lost);
       else { try { viewer.frame(performance.now()); } catch (e) { msg('' + e, 'err'); } }
     }
-    const now = performance.now(); ms.push(now - last); last = now; if (ms.length > 120) ms.shift();
+    const now = performance.now(); const dt = now - last; last = now;
+    // Only frames that actually submitted ensembles count: after convergence the loop idles at the display
+    // rate, which must not replace the render cost. The window restarts with every history reset.
+    const ep = viewer.history_epoch(), ctr = viewer.ensemble_counter();
+    if (ep !== lastEpoch) { lastEpoch = ep; ms = []; msWarm = 0; prevActive = false; }
+    const active = ctr !== lastCounter; lastCounter = ctr;
+    if (active && prevActive) { if (msWarm < WARMUP_FRAMES) msWarm++; else { ms.push(dt); if (ms.length > 120) ms.shift(); } }
+    prevActive = active;
     requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
@@ -505,11 +518,11 @@
   setInterval(async () => {
     if (reiniting) return;
     const s = JSON.parse(viewer.stats_json());
-    const sorted = [...ms].sort((a, b) => a - b);
-    const p = (q) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))].toFixed(1) : '-';
+    const fm = frameMsStats();
+    const p = (q) => { const v = q === 0.5 ? fm.p50 : fm.p95; return v === null ? '-' : v.toFixed(1); };
     let t = `${s.scene}\n${s.width}x${s.height}  SPP ${s.spp}\n累積 ${s.accumulated}/${s.target}\n`
           + `粒子数/ensemble ${s.accumulated > 0 ? Math.round(s.points / s.accumulated).toLocaleString() : '-'}  可視splat ${s.accumulated > 0 ? Math.round(s.visible / s.accumulated).toLocaleString() : '-'}\n`
-          + `フレーム間隔 p50 ${p(0.5)}ms p95 ${p(0.95)}ms\nGPUバッファ推定 ${s.memory_mib} MiB
+          + `描画フレーム間隔 p50 ${p(0.5)}ms p95 ${p(0.95)}ms\nGPUバッファ推定 ${s.memory_mib} MiB
 SH ${s.sh_degree}/${s.sh_max}  ensemble/フレーム ${s.ensembles_per_frame}  seed ${s.seed}
 カメラ yaw ${s.yaw} pitch ${s.pitch} dist ${s.distance}`;
     if (s.method !== 'GPS') t += `
