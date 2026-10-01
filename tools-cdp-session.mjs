@@ -95,6 +95,21 @@ try {
 
   check('invalid session is rejected', (await ev(`(() => { try { window.__gps.applySession({ format: 'nope' }); return 'accepted'; } catch (e) { return 'rejected'; } })()`)) === 'rejected');
 
+  // Pointer navigation: left drag orbits (yaw changes, target fixed); right drag and Shift+left drag pan (target moves, yaw fixed).
+  const drag = (opts, dx) => ev(`(async () => { const c = document.getElementById('cv'); const r = c.getBoundingClientRect(); const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const cam0 = window.__gps.getSession().camera;
+    const pe = (t, d) => c.dispatchEvent(new PointerEvent(t, { clientX: x + d, clientY: y + d / 2, pointerId: 1, bubbles: true, ...${JSON.stringify(opts)} }));
+    pe('pointerdown', 0); for (let i = 1; i <= 5; i++) { pe('pointermove', i * ${dx} / 5); await new Promise((r) => requestAnimationFrame(r)); } pe('pointerup', ${dx});
+    const cam1 = window.__gps.getSession().camera;
+    const dt = Math.hypot(...cam1.target.map((v, k) => v - cam0.target[k])), dy = Math.abs(cam1.yaw - cam0.yaw);
+    return JSON.stringify({ dTarget: dt, dYaw: dy }); })()`).then(JSON.parse);
+  const orb = await drag({ button: 0 }, 60);
+  check('left drag orbits without moving the target', orb.dYaw > 0.05 && orb.dTarget < 1e-9, JSON.stringify(orb));
+  const pr = await drag({ button: 2 }, 60);
+  check('right drag pans (target moves, yaw fixed)', pr.dTarget > 1e-3 && pr.dYaw < 1e-9, JSON.stringify(pr));
+  const ps = await drag({ button: 0, shiftKey: true }, -60);
+  check('Shift+left drag pans', ps.dTarget > 1e-3 && ps.dYaw < 1e-9, JSON.stringify(ps));
+
   await ev(`window.__gps.applySession(${sess1})`);
   await settle(12);
   const zipB64 = await ev(`(async () => { const blob = await window.__gps.renderTrajectory(window.__gps.orbitKeys(), 3);

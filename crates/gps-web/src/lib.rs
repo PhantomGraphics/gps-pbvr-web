@@ -377,6 +377,13 @@ impl Viewer {
         self.invalidate();
     }
 
+    /// Translates the camera target in the view plane (`dx`, `dy` in CSS pixels, `view_height` = CSS height of the canvas).
+    pub fn pan(&mut self, dx: f64, dy: f64, view_height: f64) {
+        self.last_input_ms = self.last_frame_ms;
+        self.cam.pan(dx, dy, view_height);
+        self.invalidate();
+    }
+
     pub fn zoom(&mut self, wheel: f64) {
         self.last_input_ms = self.last_frame_ms;
         self.cam.zoom((wheel * 0.001).exp());

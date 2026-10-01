@@ -44,6 +44,17 @@ impl OrbitCamera {
         self.pitch = (self.pitch + d_pitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
+    /// Translates the orbit target in the view plane so the scene follows the pointer: a drag of
+    /// (`dx`, `dy`) pixels on a view `view_height` pixels tall moves the point under the target by exactly that
+    /// much on screen (the scale is distance * 2 tan(fov / 2) / view_height).
+    pub fn pan(&mut self, dx: f64, dy: f64, view_height: f64) {
+        let cam = self.to_camera(1, 1);
+        let r = cam.view_rot.transpose();      // columns = camera axes in world space
+        let (right, down) = (r.col(0), r.col(1));
+        let s = self.distance * 2.0 * (0.5 * self.fov_y).tan() / view_height.max(1.0);
+        self.target -= right * (dx * s) + down * (dy * s);
+    }
+
     /// Multiplicative zoom; `factor` > 1 moves away.
     pub fn zoom(&mut self, factor: f64) {
         self.distance = (self.distance * factor).clamp(1e-4, 1e6);
@@ -92,6 +103,25 @@ mod tests {
             let cam = c.to_camera(64, 48);
             let t = cam.view_rot * (c.target - cam.view_pos);
             assert!(t.x.abs() < 1e-9 && t.y.abs() < 1e-9 && (t.z - 7.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn pan_moves_the_scene_with_the_pointer() {
+        for up in [DVec3::Y, -DVec3::Y] {
+            let mut c = OrbitCamera { target: DVec3::new(0.3, -0.2, 1.0), distance: 4.0, yaw: 0.7, pitch: 0.4, up, ..Default::default() };
+            let h = 720.0;
+            // pixel of the old target before and after a (+40, -25) pixel drag
+            let project = |c: &OrbitCamera, p: DVec3| {
+                let cam = c.to_camera(1280, 720);
+                let q = cam.view_rot * (p - cam.view_pos);
+                (cam.focal_x * q.x / q.z + 640.0, cam.focal_y * q.y / q.z + 360.0)
+            };
+            let p0 = c.target;
+            let before = project(&c, p0);
+            c.pan(40.0, -25.0, h);
+            let after = project(&c, p0);
+            assert!((after.0 - before.0 - 40.0).abs() < 1e-6 && (after.1 - before.1 + 25.0).abs() < 1e-6, "{before:?} -> {after:?}");
         }
     }
 

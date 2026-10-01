@@ -38,7 +38,7 @@
     <h1>GPS × PBVR — Gaussian Point Splatting (WebGPU)</h1>
     <div class="hint" id="env"></div>
     <div id="stage"><canvas id="cv" width="1280" height="720"></canvas></div>
-    <p class="hint">ドラッグ: 回転 / ホイール: ズーム。カメラ・設定・データを変えると累積がリセットされ、静止すると収束します。</p>
+    <p class="hint">左ドラッグ: 回転 / 右ドラッグ・中ボタン・Shift+ドラッグ: 平行移動 / ホイール: ズーム。カメラ・設定・データを変えると累積がリセットされ、静止すると収束します。</p>
   </div>
   <aside>
     <section>
@@ -258,12 +258,19 @@
   // ------------------------------------------------------------------ canvas input
   const bindCanvas = () => {
     let drag = null;
-    cv.addEventListener('pointerdown', (e) => { drag = [e.clientX, e.clientY]; try { cv.setPointerCapture(e.pointerId); } catch {} });
+    let pan = false;
+    cv.addEventListener('contextmenu', (e) => e.preventDefault());
+    cv.addEventListener('pointerdown', (e) => {
+      drag = [e.clientX, e.clientY];
+      pan = e.button === 2 || e.button === 1 || e.shiftKey;   // right / middle button or Shift+drag = translate
+      try { cv.setPointerCapture(e.pointerId); } catch {}
+    });
     cv.addEventListener('pointerup', () => { drag = null; });
     cv.addEventListener('pointermove', (e) => {
       if (!drag || busy) return;
       // CSS pixels, so the rotation speed does not depend on the internal resolution
-      viewer.orbit(e.clientX - drag[0], e.clientY - drag[1]);
+      if (pan) viewer.pan(e.clientX - drag[0], e.clientY - drag[1], cv.getBoundingClientRect().height);
+      else viewer.orbit(e.clientX - drag[0], e.clientY - drag[1]);
       drag = [e.clientX, e.clientY];
     });
     cv.addEventListener('wheel', (e) => { e.preventDefault(); if (!busy) viewer.zoom(e.deltaY); }, { passive: false });
