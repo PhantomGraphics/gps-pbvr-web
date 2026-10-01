@@ -29,3 +29,22 @@ WebGPU needs HTTPS or localhost. Methods: GPS, PBVR Proportional / Extinction / 
 `tests/fixtures/cpp_*.f64` are outputs of the original C++ implementation, checked in so that
 `cargo test` (the `cpp_crosscheck` test) is self-contained. They are generated and owned by the
 Crystal2024 parent project, not by this repository.
+
+## Reproducibility and output
+
+- **Session JSON** ("設定を保存/読み込み"): all settings, the orbit camera and the seed. Same data + same session = the same
+  image (checked by `tools-cdp-session.mjs`: identical PNG after a page reload and after device-loss recovery).
+- **Outputs**: PNG, stats (JSON / CSV), and a camera trajectory exported as one ZIP (PNG sequence + `stats.csv` +
+  `session.json`), either from keyframes or a 360-degree orbit.
+- **Robustness**: a lost GPU device is detected, the viewer is recreated and the scene and session restored.
+
+## Static distribution
+
+`./build-dist.ps1` writes `dist/` (`index.html`, `check.html`, `pkg/gps_web.js`, `pkg/gps_web_bg.wasm`). Host it over
+HTTPS with `.wasm` served as `application/wasm`. Without WebGPU the page shows an explanation; tested on Chrome / Edge 154
+(Windows, integrated GPU). Firefox / Safari are not verified yet.
+
+## Browser tests
+
+`node tools-cdp-check.mjs <browser.exe> <url>/check.html` (GPU-vs-CPU checks), `node tools-cdp-session.mjs <browser.exe> <out-dir>`
+(session / reproducibility / device loss / trajectory ZIP; needs `python` for `tools-check-zip.py`).

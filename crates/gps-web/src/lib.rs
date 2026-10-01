@@ -91,7 +91,11 @@ pub struct Viewer {
     params: RenderParams,
     width: u32,
     height: u32,
+    /// first ensemble seed after a reset (part of the reproducible session state)
+    seed: u32,
     next_seed: u32,
+    /// set by the device-lost callback; the page recreates the viewer
+    lost: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     per_frame: u32,
     target: u32,
     /// ensemble LOD: false = Manual (`per_frame` every frame), true = Adaptive (frame-time driven, 1 while moving)
@@ -133,6 +137,15 @@ impl Viewer {
             .await
             .map_err(js_err)?;
         let surface_format = pick_format(&surface.get_capabilities(&adapter)).map_err(js_err)?;
+        let lost = std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let lost = lost.clone();
+            device.set_device_lost_callback(move |reason, msg| {
+                if let Ok(mut g) = lost.lock() {
+                    *g = Some(format!("{reason:?}: {msg}"));
+                }
+            });
+        }
         let params = RenderParams::default();
         let renderer = GpsRenderer::new(device, queue, surface_format, width, height, params.spp_side).map_err(js_err)?;
         let mut v = Viewer {
@@ -144,7 +157,9 @@ impl Viewer {
             params,
             width,
             height,
+            seed: 1,
             next_seed: 1,
+            lost,
             per_frame: 1,
             target: 256,
             lod_adaptive: false,
@@ -285,6 +300,50 @@ impl Viewer {
         self.invalidate();
     }
 
+    /// First ensemble seed after every reset. Same seed + same settings + same camera = identical image.
+    pub fn set_seed(&mut self, seed: u32) {
+        self.seed = seed;
+        self.invalidate();
+    }
+
+    pub fn seed(&self) -> u32 {
+        self.seed
+    }
+
+    /// Camera as JSON (`target`, `distance`, `yaw`, `pitch`, `fov_y`, `up_y`: +1 = Y up, -1 = Y down).
+    pub fn camera_json(&self) -> String {
+        let c = &self.cam;
+        format!(
+            "{{\"target\":[{},{},{}],\"distance\":{},\"yaw\":{},\"pitch\":{},\"fov_y\":{},\"up_y\":{}}}",
+            c.target.x, c.target.y, c.target.z, c.distance, c.yaw, c.pitch, c.fov_y, if c.up.y < 0.0 { -1 } else { 1 }
+        )
+    }
+
+    /// Sets the orbit camera (values are validated; non-finite input is rejected). Resets accumulation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_camera(&mut self, tx: f64, ty: f64, tz: f64, distance: f64, yaw: f64, pitch: f64, fov_y: f64) -> Result<(), JsValue> {
+        if ![tx, ty, tz, distance, yaw, pitch, fov_y].iter().all(|v| v.is_finite()) || distance <= 0.0 || !(0.05..3.0).contains(&fov_y) {
+            return Err(js_err("invalid camera values"));
+        }
+        self.cam.target = DVec3::new(tx, ty, tz);
+        self.cam.distance = distance.clamp(1e-4, 1e6);
+        self.cam.yaw = yaw;
+        self.cam.pitch = pitch.clamp(-1.553, 1.553);
+        self.cam.fov_y = fov_y;
+        self.invalidate();
+        Ok(())
+    }
+
+    /// Why the GPU device was lost (None while healthy). The page recreates the viewer.
+    pub fn device_lost(&self) -> Option<String> {
+        self.lost.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Test hook: destroys the device to exercise the device-lost path.
+    pub fn debug_lose_device(&self) {
+        self.renderer.device().destroy();
+    }
+
     /// Active SH degree 0..=3 (clamped to what the scene provides). Resets accumulation.
     pub fn set_sh_degree(&mut self, degree: u32) {
         self.params.sh_degree = degree.min(3);
@@ -337,7 +396,7 @@ impl Viewer {
         if self.dirty {
             self.renderer.reset_accum();
             self.renderer.reset_stats();
-            self.next_seed = 1;
+            self.next_seed = self.seed;
             self.dirty = false;
             self.needs_present = true;
         }
@@ -412,7 +471,7 @@ impl Viewer {
         let s = self.renderer.latest_stats();
         let m = estimate_memory(self.width, self.height, self.params.spp_side, self.renderer.gaussian_count() as usize);
         format!(
-            "{{\"scene\":\"{}\",\"gaussians\":{},\"width\":{},\"height\":{},\"spp\":{},\"accumulated\":{},\"target\":{},\"points\":{},\"visible\":{},\"truncated_splats\":{},\"dropped_points\":{},\"ensembles_per_frame\":{},\"sh_max\":{},\"sh_degree\":{},\"orphan\":{},\"candidates\":{},\"undercovered\":{},\"method\":\"{}\",\"memory_mib\":{:.1},\"yaw\":{:.4},\"pitch\":{:.4},\"distance\":{:.4}}}",
+            "{{\"scene\":\"{}\",\"gaussians\":{},\"width\":{},\"height\":{},\"spp\":{},\"accumulated\":{},\"target\":{},\"points\":{},\"visible\":{},\"truncated_splats\":{},\"dropped_points\":{},\"seed\":{},\"ensembles_per_frame\":{},\"sh_max\":{},\"sh_degree\":{},\"orphan\":{},\"candidates\":{},\"undercovered\":{},\"method\":\"{}\",\"memory_mib\":{:.1},\"yaw\":{:.4},\"pitch\":{:.4},\"distance\":{:.4}}}",
             self.scene_info.replace('"', "'"),
             self.renderer.gaussian_count(),
             self.width,
@@ -424,6 +483,7 @@ impl Viewer {
             s.visible_splats,
             s.truncated_splats,
             s.dropped_points,
+            self.seed,
             self.effective_per_frame,
             self.renderer.sh_max_degree(),
             self.params.sh_degree.min(self.renderer.sh_max_degree()),

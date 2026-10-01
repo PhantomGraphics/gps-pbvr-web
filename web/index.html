@@ -96,7 +96,20 @@
     </section>
     <section>
       <h2>操作</h2>
-      <div class="row"><button id="reset">視点と累積をリセット</button><button id="save" class="secondary">PNG保存</button><button id="savestats" class="secondary">統計保存(JSON)</button></div>
+      <div class="row"><button id="reset">視点と累積をリセット</button><button id="save" class="secondary">PNG保存</button></div>
+    </section>
+    <section>
+      <h2>再現・出力</h2>
+      <label>seed <input type="number" id="seed" min="0" max="4294967295" value="1"></label>
+      <div class="row"><button id="savesession" class="secondary">設定を保存(JSON)</button>
+        <label class="secondary" style="margin:0;display:inline-block">設定を読み込み <input type="file" id="loadsession" accept=".json" style="width:9em"></label></div>
+      <div class="row" style="margin-top:6px"><button id="savestats" class="secondary">統計(JSON)</button><button id="savecsv" class="secondary">統計(CSV)</button></div>
+      <details style="margin-top:6px"><summary>カメラ軌道 → ZIP（PNG連番 + stats.csv + session.json）</summary>
+        <div class="row" style="margin:6px 0"><button id="addkey" class="secondary">キーフレーム追加</button><button id="clearkeys" class="secondary">クリア</button><span id="keys" class="hint"></span></div>
+        <label>フレーム数 <input type="number" id="tframes" min="1" max="720" value="24"></label>
+        <div class="row"><button id="trajkeys">キーフレーム軌道を出力</button><button id="trajorbit">周回軌道(360°)を出力</button></div>
+        <div class="hint">各フレームを累積目標まで描いて保存します（seed・設定固定のため再実行で同一画像）。</div>
+      </details>
     </section>
     <section>
       <h2>状態</h2>
@@ -114,10 +127,20 @@
   $('env').textContent = navigator.userAgent;
   const { default: init, Viewer } = await import('./pkg/gps_web.js');
   await init();
-  const cv = $('cv');
+  let cv = $('cv');
   let viewer;
-  try { viewer = await Viewer.create(cv); } catch (e) { msg('初期化に失敗: ' + e, 'err'); throw e; }
+  let busy = false;                       // trajectory export / re-initialisation in progress: ignore camera input
+  let scene = { kind: 'demo', name: 'demo', bytes: null };   // what to reload after a device loss
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+  const download = (blob, name) => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+
+  // ------------------------------------------------------------------ settings
   const apply = () => {
     const [w, h] = $('res').value.split('x').map(Number);
     const density = Math.pow(10, parseFloat($('density').value));
@@ -161,8 +184,6 @@
     $('radial').disabled = !radialOk;
     viewer.set_method(m, +$('calib').value, $('radial').checked && radialOk, $('centre').checked, $('jitter').checked, +$('basek').value, +$('reflen').value);
   };
-  for (const id of ['method', 'calib', 'radial', 'centre', 'jitter', 'basek', 'reflen']) $(id).addEventListener('change', applyMethod);
-  applyMethod();
   const syncSh = (useMax = false) => {
     const mx = viewer.sh_max_degree();
     if (useMax) $('sh').value = String(mx);
@@ -171,17 +192,55 @@
     viewer.set_sh_degree(+$('sh').value);
   };
   const applySh = () => viewer.set_sh_degree(+$('sh').value);
-  const applyLod = () => viewer.set_lod($('lod').value === 'adaptive', 33.3);
-  $('sh').addEventListener('change', applySh);
-  $('lod').addEventListener('change', () => { applyLod(); $('perframe').disabled = $('lod').value === 'adaptive'; });
-  applySh(); applyLod();
+  const applyLod = () => { viewer.set_lod($('lod').value === 'adaptive', 33.3); $('perframe').disabled = $('lod').value === 'adaptive'; };
+  const applySeed = () => viewer.set_seed(Math.max(0, Math.floor(+$('seed').value || 0)) >>> 0);
+  for (const id of ['method', 'calib', 'radial', 'centre', 'jitter', 'basek', 'reflen']) $(id).addEventListener('change', () => applyMethod());
+  $('sh').addEventListener('change', () => applySh());
+  $('lod').addEventListener('change', () => applyLod());
+  $('seed').addEventListener('change', () => applySeed());
   $('ydown').addEventListener('change', () => viewer.set_y_down($('ydown').checked));
   $('reset').onclick = () => viewer.reset_view();   // camera back to the load-time framing + restart accumulation
 
+  // ------------------------------------------------------------------ session (reproducible state)
+  const SETTING_IDS = ['preset', 'res', 'spp', 'density', 'target', 'perframe', 'maxpts', 'sh', 'lod', 'seed', 'method', 'calib', 'basek', 'reflen'];
+  const CHECK_IDS = ['radial', 'centre', 'jitter', 'ydown'];
+  const getSession = () => {
+    const settings = {};
+    for (const id of SETTING_IDS) settings[id] = $(id).value;
+    for (const id of CHECK_IDS) settings[id] = $(id).checked;
+    return {
+      format: 'gps-pbvr-session', version: 1,
+      scene: { name: scene.name, gaussians: JSON.parse(viewer.stats_json()).gaussians },
+      settings, camera: JSON.parse(viewer.camera_json()),
+    };
+  };
+  const applySession = (s) => {
+    if (!s || s.format !== 'gps-pbvr-session' || s.version !== 1) throw new Error('not a gps-pbvr session (format/version mismatch)');
+    const st = s.settings || {};
+    for (const id of SETTING_IDS) if (st[id] !== undefined) $(id).value = String(st[id]);
+    for (const id of CHECK_IDS) if (st[id] !== undefined) $(id).checked = !!st[id];
+    apply(); applyMethod(); applySh(); applyLod(); applySeed();
+    viewer.set_y_down($('ydown').checked);
+    const c = s.camera;
+    if (c) {
+      if (c.up_y !== undefined) { $('ydown').checked = c.up_y < 0; viewer.set_y_down(c.up_y < 0); }
+      viewer.set_camera(c.target[0], c.target[1], c.target[2], c.distance, c.yaw, c.pitch, c.fov_y);
+    }
+  };
+  $('savesession').onclick = () => download(new Blob([JSON.stringify(getSession(), null, 2)], { type: 'application/json' }), 'session.json');
+  $('loadsession').addEventListener('change', async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    try { applySession(JSON.parse(await f.text())); msg(`設定を読み込みました: ${f.name}`, 'ok'); }
+    catch (err) { msg('設定を読み込めません: ' + err, 'err'); }
+    e.target.value = '';
+  });
+
+  // ------------------------------------------------------------------ scene loading
   const loadBytes = async (file) => {
     try {
       const buf = new Uint8Array(await file.arrayBuffer());
       const info = viewer.load_ply(buf);
+      scene = { kind: 'ply', name: file.name, bytes: buf };
       $('ydown').checked = true;
       syncSh(true);
       msg(`${file.name}: ${info}`, 'ok');
@@ -192,62 +251,170 @@
   drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
   drop.addEventListener('dragleave', () => drop.classList.remove('over'));
   drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); e.dataTransfer.files[0] && loadBytes(e.dataTransfer.files[0]); });
-  $('demo').onclick = () => { try { msg(viewer.load_demo(), 'ok'); syncSh(); $('ydown').checked = false; } catch (e) { msg('' + e, 'err'); } };
+  $('demo').onclick = () => { try { msg(viewer.load_demo(), 'ok'); scene = { kind: 'demo', name: 'demo', bytes: null }; syncSh(); $('ydown').checked = false; } catch (e) { msg('' + e, 'err'); } };
 
-  let drag = null;
-  cv.addEventListener('pointerdown', (e) => { drag = [e.clientX, e.clientY]; try { cv.setPointerCapture(e.pointerId); } catch {} });
-  cv.addEventListener('pointerup', () => { drag = null; });
-  cv.addEventListener('pointermove', (e) => {
-    if (!drag) return;
-    // CSS pixels, so the rotation speed does not depend on the internal resolution
-    viewer.orbit(e.clientX - drag[0], e.clientY - drag[1]);
-    drag = [e.clientX, e.clientY];
-  });
-  cv.addEventListener('wheel', (e) => { e.preventDefault(); viewer.zoom(e.deltaY); }, { passive: false });
-
-  // Stats for comparing methods: downloads the current state and counters as JSON.
-  $('savestats').onclick = () => {
-    const s = JSON.parse(viewer.stats_json());
-    s.settings = { method: $('method').value, calibration: $('calib').value, radial: $('radial').checked, centre_depth: $('centre').checked,
-      jitter: $('jitter').checked, base_k: +$('basek').value, reference_pixel_length: +$('reflen').value, density: $('densityv').textContent,
-      resolution: $('res').value, spp_side: $('spp').value };
-    s.frame_ms = { p50: [...ms].sort((a, b) => a - b)[Math.floor(ms.length * 0.5)] ?? null };
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' }));
-    a.download = `stats_${s.method.replace(/\s+/g, '_')}_${s.accumulated}spf.json`; a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  // ------------------------------------------------------------------ canvas input
+  const bindCanvas = () => {
+    let drag = null;
+    cv.addEventListener('pointerdown', (e) => { drag = [e.clientX, e.clientY]; try { cv.setPointerCapture(e.pointerId); } catch {} });
+    cv.addEventListener('pointerup', () => { drag = null; });
+    cv.addEventListener('pointermove', (e) => {
+      if (!drag || busy) return;
+      // CSS pixels, so the rotation speed does not depend on the internal resolution
+      viewer.orbit(e.clientX - drag[0], e.clientY - drag[1]);
+      drag = [e.clientX, e.clientY];
+    });
+    cv.addEventListener('wheel', (e) => { e.preventDefault(); if (!busy) viewer.zoom(e.deltaY); }, { passive: false });
   };
-  $('save').onclick = () => {
+  bindCanvas();
+
+  // ------------------------------------------------------------------ outputs: PNG / JSON / CSV
+  let ms = [];
+  const methodTag = () => $('method').selectedOptions[0].text.split('（')[0].replace(/\s+/g, '_');
+  const CSV_COLS = ['method', 'seed', 'accumulated', 'points', 'candidates', 'visible', 'truncated_splats', 'dropped_points', 'orphan', 'undercovered', 'width', 'height', 'spp', 'yaw', 'pitch', 'distance'];
+  const csvRow = (s, extra = []) => [...extra, ...CSV_COLS.map((k) => String(s[k]).replace(/[",\n]/g, ' '))].join(',');
+  // stats_json requests a counter readback and returns the previous one, so ask twice with a pause
+  const freshStats = async () => { viewer.stats_json(); await sleep(150); return JSON.parse(viewer.stats_json()); };
+  const canvasPng = () => new Promise((resolve) => {
     viewer.redraw();
     viewer.frame(performance.now());   // present in this task so toBlob sees it
-    cv.toBlob((b) => {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(b); a.download = `${$('method').selectedOptions[0].text.split('（')[0].replace(/\s+/g, '_')}_${viewer.accumulated()}spf.png`; a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-    });
+    cv.toBlob(async (b) => resolve(new Uint8Array(await b.arrayBuffer())));
+  });
+  $('save').onclick = async () => download(new Blob([await canvasPng()], { type: 'image/png' }), `${methodTag()}_${viewer.accumulated()}spf.png`);
+  $('savestats').onclick = async () => {
+    const s = await freshStats();
+    s.session = getSession();
+    s.frame_ms = { p50: [...ms].sort((a, b) => a - b)[Math.floor(ms.length * 0.5)] ?? null };
+    download(new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' }), `stats_${methodTag()}_${s.accumulated}spf.json`);
+  };
+  $('savecsv').onclick = async () => {
+    const s = await freshStats();
+    download(new Blob([CSV_COLS.join(',') + '\n' + csvRow(s) + '\n'], { type: 'text/csv' }), `stats_${methodTag()}_${s.accumulated}spf.csv`);
   };
 
-  apply();
+  // ------------------------------------------------------------------ camera trajectory -> ZIP
+  const crcTable = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+  const crc32 = (d) => { let c = 0xffffffff; for (let i = 0; i < d.length; i++) c = crcTable[(c ^ d[i]) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+  // Minimal ZIP writer (method 0 = stored; PNGs are already compressed).
+  const makeZip = (entries) => {
+    const enc = new TextEncoder(); const parts = []; const central = []; let offset = 0;
+    const u16 = (v) => new Uint8Array([v & 255, (v >>> 8) & 255]);
+    const u32 = (v) => new Uint8Array([v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255]);
+    const cat = (...a) => { const n = a.reduce((x, y) => x + y.length, 0); const o = new Uint8Array(n); let p = 0; for (const y of a) { o.set(y, p); p += y.length; } return o; };
+    for (const e of entries) {
+      const name = enc.encode(e.name), crc = crc32(e.data);
+      const local = cat(u32(0x04034b50), u16(20), u16(0x0800), u16(0), u16(0), u16(0x21), u32(crc), u32(e.data.length), u32(e.data.length), u16(name.length), u16(0), name);
+      central.push(cat(u32(0x02014b50), u16(20), u16(20), u16(0x0800), u16(0), u16(0), u16(0x21), u32(crc), u32(e.data.length), u32(e.data.length), u16(name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset), name));
+      parts.push(local, e.data); offset += local.length + e.data.length;
+    }
+    const cd = cat(...central);
+    parts.push(cd, cat(u32(0x06054b50), u16(0), u16(0), u16(entries.length), u16(entries.length), u32(cd.length), u32(offset), u16(0)));
+    return new Blob(parts, { type: 'application/zip' });
+  };
+
+  let keyframes = [];
+  const showKeys = () => { $('keys').textContent = `キーフレーム ${keyframes.length} 個`; };
+  $('addkey').onclick = () => { keyframes.push(JSON.parse(viewer.camera_json())); showKeys(); };
+  $('clearkeys').onclick = () => { keyframes = []; showKeys(); };
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const camAt = (keys, u) => {            // u in [0, 1] along the piecewise-linear path
+    if (keys.length === 1) return keys[0];
+    const x = u * (keys.length - 1), i = Math.min(Math.floor(x), keys.length - 2), t = x - i, a = keys[i], b = keys[i + 1];
+    return { ...a, target: a.target.map((v, k) => lerp(v, b.target[k], t)), distance: lerp(a.distance, b.distance, t),
+      yaw: lerp(a.yaw, b.yaw, t), pitch: lerp(a.pitch, b.pitch, t), fov_y: lerp(a.fov_y, b.fov_y, t) };
+  };
+  const orbitKeys = () => {              // one full turn around the current view
+    const c = JSON.parse(viewer.camera_json());
+    return [0, 0.25, 0.5, 0.75, 1].map((f) => ({ ...c, yaw: c.yaw + f * Math.PI * 2 }));
+  };
+  const renderTrajectory = async (keys, count) => {
+    if (busy) throw new Error('busy');
+    busy = true;
+    const files = []; const rows = [['frame', ...CSV_COLS].join(',')];
+    const saved = JSON.parse(viewer.camera_json());
+    try {
+      const session = getSession();
+      for (let i = 0; i < count; i++) {
+        const c = camAt(keys, count === 1 ? 0 : i / (count - 1));
+        viewer.set_camera(c.target[0], c.target[1], c.target[2], c.distance, c.yaw, c.pitch, c.fov_y);
+        await nextFrame(); await nextFrame();     // the reset happens in the next frame() (rAF order vs. the render loop is not fixed)
+        for (let n = 0; n < 6000 && viewer.accumulated() < +$('target').value; n++) await nextFrame();
+        const s = await freshStats();
+        files.push({ name: `frame_${String(i).padStart(4, '0')}.png`, data: await canvasPng() });
+        rows.push(csvRow(s, [i]));
+        msg(`軌道出力 ${i + 1}/${count}`);
+      }
+      const enc = new TextEncoder();
+      files.push({ name: 'stats.csv', data: enc.encode(rows.join('\n') + '\n') });
+      files.push({ name: 'session.json', data: enc.encode(JSON.stringify({ ...session, trajectory: keys }, null, 2)) });
+      return makeZip(files);
+    } finally {
+      viewer.set_camera(saved.target[0], saved.target[1], saved.target[2], saved.distance, saved.yaw, saved.pitch, saved.fov_y);
+      busy = false;
+    }
+  };
+  const runTrajectory = async (keys) => {
+    const n = Math.max(1, Math.min(720, Math.floor(+$('tframes').value) || 1));
+    try { download(await renderTrajectory(keys, n), `trajectory_${methodTag()}_${n}f.zip`); msg(`軌道出力完了（${n} フレーム）`, 'ok'); }
+    catch (e) { msg('軌道出力に失敗: ' + e, 'err'); }
+  };
+  $('trajkeys').onclick = () => keyframes.length ? runTrajectory(keyframes) : msg('キーフレームがありません（視点を動かして「キーフレーム追加」）', 'err');
+  $('trajorbit').onclick = () => runTrajectory(orbitKeys());
+
+  // ------------------------------------------------------------------ robustness: device lost / hidden tab
+  let reiniting = false;
+  const reinit = async (why) => {
+    if (reiniting) return;
+    reiniting = true; busy = true;
+    msg(`GPU デバイスが失われました（${why}）。再初期化します…`, 'err');
+    try {
+      const session = getSession();
+      const fresh = cv.cloneNode(false);          // a canvas that already had a WebGPU context cannot be reused
+      cv.replaceWith(fresh); cv = fresh; bindCanvas();
+      viewer = await Viewer.create(cv);
+      if (scene.kind === 'ply') viewer.load_ply(scene.bytes); else viewer.load_demo();
+      syncSh(scene.kind === 'ply');
+      applySession(session);
+      msg('GPU を再初期化しました。', 'ok');
+    } catch (e) { msg('再初期化に失敗しました。ページを再読み込みしてください: ' + e, 'err'); }
+    finally { reiniting = false; busy = false; }
+  };
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && viewer) viewer.redraw(); });
+
+  // ------------------------------------------------------------------ start
+  try { viewer = await Viewer.create(cv); } catch (e) { msg('初期化に失敗: ' + e, 'err'); throw e; }
+  apply(); applyMethod(); applySh(); applyLod(); applySeed(); showKeys();
   viewer.load_demo(); syncSh(); msg('デモシーンを表示中。PLY をドロップすると置き換わります。');
   $('ydown').checked = false;
 
-  let ms = [];
   let last = performance.now();
   const tick = () => {
-    try { viewer.frame(performance.now()); } catch (e) { msg('' + e, 'err'); }
+    if (!reiniting) {
+      const lost = viewer.device_lost();
+      if (lost) reinit(lost);
+      else { try { viewer.frame(performance.now()); } catch (e) { msg('' + e, 'err'); } }
+    }
     const now = performance.now(); ms.push(now - last); last = now; if (ms.length > 120) ms.shift();
     requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
 
+  // hooks for the automated browser tests (tools-cdp-session.mjs)
+  window.__gps = {
+    getSession, applySession, loadBytes, canvasPng, renderTrajectory, orbitKeys, freshStats,
+    loseDevice: () => viewer.debug_lose_device(), isBusy: () => busy || reiniting,
+    accumulated: () => viewer.accumulated(),
+  };
+
   setInterval(async () => {
+    if (reiniting) return;
     const s = JSON.parse(viewer.stats_json());
     const sorted = [...ms].sort((a, b) => a - b);
     const p = (q) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))].toFixed(1) : '-';
     let t = `${s.scene}\n${s.width}x${s.height}  SPP ${s.spp}\n累積 ${s.accumulated}/${s.target}\n`
           + `粒子数/ensemble ${s.accumulated > 0 ? Math.round(s.points / s.accumulated).toLocaleString() : '-'}  可視splat ${s.accumulated > 0 ? Math.round(s.visible / s.accumulated).toLocaleString() : '-'}\n`
           + `フレーム間隔 p50 ${p(0.5)}ms p95 ${p(0.95)}ms\nGPUバッファ推定 ${s.memory_mib} MiB
-SH ${s.sh_degree}/${s.sh_max}  ensemble/フレーム ${s.ensembles_per_frame}
+SH ${s.sh_degree}/${s.sh_max}  ensemble/フレーム ${s.ensembles_per_frame}  seed ${s.seed}
 カメラ yaw ${s.yaw} pitch ${s.pitch} dist ${s.distance}`;
     if (s.method !== 'GPS') t += `
 方式 ${s.method}  候補粒子/ensemble ${s.accumulated > 0 ? Math.round(s.candidates / s.accumulated).toLocaleString() : '-'}`;
