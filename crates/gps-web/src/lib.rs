@@ -107,6 +107,9 @@ pub struct Viewer {
     effective_per_frame: u32,
     lod_n: u32,
     lod_quiet: u32,
+    /// Adaptive LOD: per-splat particle cap used while the camera moves (the full cap applies once still)
+    moving_cap: u32,
+    lod_moving: bool,
     dirty: bool,
     needs_present: bool,
     scene_info: String,
@@ -170,6 +173,8 @@ impl Viewer {
             effective_per_frame: 1,
             lod_n: 1,
             lod_quiet: 0,
+            moving_cap: 2048,
+            lod_moving: false,
             dirty: true,
             needs_present: true,
             scene_info: String::new(),
@@ -246,18 +251,8 @@ impl Viewer {
     }
 
     fn frame_scene(&mut self, g: &[GpuGaussian], y_down: bool) {
-        // Robust framing: per-axis median as the centre and the 75th percentile of the distance to it as the
-        // radius, because real captures carry far background Gaussians / floaters that dominate a mean or 90th percentile.
-        let pos = |p: &GpuGaussian| DVec3::new(p.pos_opacity[0] as f64, p.pos_opacity[1] as f64, p.pos_opacity[2] as f64);
-        let median = |axis: usize| {
-            let mut v: Vec<f64> = g.iter().map(|p| pos(p)[axis]).collect();
-            v.sort_by(|a, b| a.total_cmp(b));
-            v[v.len() / 2]
-        };
-        let c = DVec3::new(median(0), median(1), median(2));
-        let mut d: Vec<f64> = g.iter().map(|p| (pos(p) - c).length()).collect();
-        d.sort_by(|a, b| a.total_cmp(b));
-        let radius = d[((d.len() as f64 * 0.75) as usize).min(d.len() - 1)];
+        let pts = g.iter().map(|p| DVec3::new(p.pos_opacity[0] as f64, p.pos_opacity[1] as f64, p.pos_opacity[2] as f64));
+        let (c, radius) = OrbitCamera::robust_sphere(pts).unwrap_or((DVec3::ZERO, 1.0));
         self.cam = OrbitCamera { up: if y_down { -DVec3::Y } else { DVec3::Y }, pitch: 0.25, yaw: 0.6, ..Default::default() };
         self.cam.frame_sphere(c, radius.max(1e-3));
         self.home_cam = self.cam;
@@ -365,9 +360,15 @@ impl Viewer {
     /// Ensemble LOD. `adaptive = false`: always `per_frame` ensembles (Manual). `adaptive = true`:
     /// one ensemble while the camera moves, and while still as many as fit in `target_ms` of frame time
     /// (up to the engine maximum). Does not change the image statistics, only how fast it converges.
-    pub fn set_lod(&mut self, adaptive: bool, target_ms: f64) {
+    ///
+    /// Adaptive also lowers the per-splat particle cap to `moving_cap` while the camera moves (an explicitly coarser,
+    /// biased preview: very large low-opacity splats are truncated) and restarts accumulation with the full cap once
+    /// the camera is still, so the converged image is the same as with Manual.
+    pub fn set_lod(&mut self, adaptive: bool, target_ms: f64, moving_cap: u32) {
         self.lod_adaptive = adaptive;
         self.lod_target_ms = target_ms.clamp(8.0, 200.0);
+        self.moving_cap = moving_cap.clamp(64, 1 << 24);
+        self.invalidate();
     }
 
     pub fn orbit(&mut self, dx: f64, dy: f64) {
@@ -400,6 +401,11 @@ impl Viewer {
         let dt = if self.last_frame_ms > 0.0 { (now_ms - self.last_frame_ms).clamp(1.0, 500.0) } else { 16.7 };
         self.last_frame_ms = now_ms;
         self.ema_ms += 0.1 * (dt - self.ema_ms);
+        let moving = self.lod_adaptive && now_ms - self.last_input_ms < 250.0;
+        if moving != self.lod_moving {
+            self.lod_moving = moving;
+            self.dirty = true;                   // the particle cap changes, so the history restarts
+        }
         if self.dirty {
             self.renderer.reset_accum();
             self.renderer.reset_stats();
@@ -435,7 +441,11 @@ impl Viewer {
             self.effective_per_frame = want;
             let n = want.min(self.target - acc);
             let cam = self.cam.to_camera(self.width, self.height);
-            self.renderer.render_ensembles(&cam, &self.params, self.next_seed, n).map_err(js_err)?;
+            let mut p = self.params;
+            if self.lod_moving {
+                p.max_points_per_splat = p.max_points_per_splat.min(self.moving_cap);
+            }
+            self.renderer.render_ensembles(&cam, &p, self.next_seed, n).map_err(js_err)?;
             self.next_seed = self.next_seed.wrapping_add(n);
             self.needs_present = true;
         }
@@ -478,7 +488,7 @@ impl Viewer {
         let s = self.renderer.latest_stats();
         let m = estimate_memory(self.width, self.height, self.params.spp_side, self.renderer.gaussian_count() as usize);
         format!(
-            "{{\"scene\":\"{}\",\"gaussians\":{},\"width\":{},\"height\":{},\"spp\":{},\"accumulated\":{},\"target\":{},\"points\":{},\"visible\":{},\"truncated_splats\":{},\"dropped_points\":{},\"seed\":{},\"ensembles_per_frame\":{},\"sh_max\":{},\"sh_degree\":{},\"orphan\":{},\"candidates\":{},\"undercovered\":{},\"method\":\"{}\",\"memory_mib\":{:.1},\"yaw\":{:.4},\"pitch\":{:.4},\"distance\":{:.4}}}",
+            "{{\"scene\":\"{}\",\"gaussians\":{},\"width\":{},\"height\":{},\"spp\":{},\"accumulated\":{},\"target\":{},\"points\":{},\"visible\":{},\"truncated_splats\":{},\"dropped_points\":{},\"seed\":{},\"lod_moving\":{},\"ensembles_per_frame\":{},\"sh_max\":{},\"sh_degree\":{},\"orphan\":{},\"candidates\":{},\"undercovered\":{},\"skipped\":{},\"method\":\"{}\",\"memory_mib\":{:.1},\"yaw\":{:.4},\"pitch\":{:.4},\"distance\":{:.4}}}",
             self.scene_info.replace('"', "'"),
             self.renderer.gaussian_count(),
             self.width,
@@ -491,12 +501,14 @@ impl Viewer {
             s.truncated_splats,
             s.dropped_points,
             self.seed,
+            self.lod_moving,
             self.effective_per_frame,
             self.renderer.sh_max_degree(),
             self.params.sh_degree.min(self.renderer.sh_max_degree()),
             s.orphan_subpixels,
             s.candidates,
             s.undercovered_splats,
+            s.skipped_ensembles,
             self.params.method.name(),
             (m.total() + self.renderer.sh_bytes()) as f64 / 1048576.0,
             self.cam.yaw,

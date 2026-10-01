@@ -607,3 +607,72 @@ pub fn unpack_color(p: u64) -> u32 {
 pub fn unpack_depth_key(p: u64) -> u32 {
     (p >> 32) as u32
 }
+
+// ------------------------------------------------------------------ radius look-up table (GPU fast path)
+
+/// Opacity nodes of the radius table: o = 1 - (1 - x)^2 with x = i / (RADIUS_LUT_O - 1), denser towards o = 1
+/// where Li2 has its logarithmic singularity.
+pub const RADIUS_LUT_O: usize = 65;
+/// Nodes along w = sqrt(v), v = -ln(1 - u), in [0, sqrt(RADIUS_LUT_VMAX)] (r is ~linear in w near u = 0).
+pub const RADIUS_LUT_V: usize = 129;
+/// 24-bit uniforms give 1 - u >= 2^-24, i.e. v <= 16.64.
+pub const RADIUS_LUT_VMAX: f64 = 17.0;
+
+/// Whitened radius `r(o, w)` of [`sample_corrected_radius`] with `u = 1 - e^(-w^2)`, tabulated for the GPU
+/// (the per-point inverse of Li2 is the dominant cost of the exact path). Row-major, `o` slowest.
+/// r is smooth in w (it tends to sqrt(2) w for small o), so bilinear interpolation is accurate.
+pub fn radius_lut() -> Vec<f32> {
+    let mut t = Vec::with_capacity(RADIUS_LUT_O * RADIUS_LUT_V);
+    for i in 0..RADIUS_LUT_O {
+        let x = i as f64 / (RADIUS_LUT_O - 1) as f64;
+        let o = (1.0 - (1.0 - x) * (1.0 - x)).clamp(1e-6, 1.0);
+        for j in 0..RADIUS_LUT_V {
+            let w = j as f64 * RADIUS_LUT_VMAX.sqrt() / (RADIUS_LUT_V - 1) as f64;
+            let u = -(-w * w).exp_m1();
+            t.push(sample_corrected_radius(o, u) as f32);
+        }
+    }
+    t
+}
+
+/// CPU mirror of the shader's table lookup (bilinear in o and w); returns the radius.
+pub fn radius_from_lut(lut: &[f32], o: f64, u: f64) -> f64 {
+    let v = -(1.0 - u).max(6e-8).ln();
+    let fo = (1.0 - (1.0 - o.clamp(0.0, 1.0)).sqrt()) * (RADIUS_LUT_O - 1) as f64;
+    let fv = (v.sqrt() / RADIUS_LUT_VMAX.sqrt()).clamp(0.0, 1.0) * (RADIUS_LUT_V - 1) as f64;
+    let (i0, j0) = ((fo as usize).min(RADIUS_LUT_O - 2), (fv as usize).min(RADIUS_LUT_V - 2));
+    let (a, b) = (fo - i0 as f64, fv - j0 as f64);
+    let at = |i: usize, j: usize| lut[i * RADIUS_LUT_V + j] as f64;
+    let r = (1.0 - a) * ((1.0 - b) * at(i0, j0) + b * at(i0, j0 + 1)) + a * ((1.0 - b) * at(i0 + 1, j0) + b * at(i0 + 1, j0 + 1));
+    r.max(0.0)
+}
+
+#[cfg(test)]
+mod radius_lut_tests {
+    use super::*;
+
+    #[test]
+    fn lut_matches_exact_radius() {
+        let lut = radius_lut();
+        let mut worst_abs = 0.0f64;
+        let mut worst_at = (0.0, 0.0);
+        let mut s = 12345u32;
+        let mut rnd = || {
+            s = pcg_hash(s);
+            (s >> 8) as f64 / 16_777_216.0
+        };
+        for _ in 0..200_000 {
+            let (o, u) = (0.001 + 0.999 * rnd(), rnd());
+            let (a, b) = (sample_corrected_radius(o, u), radius_from_lut(&lut, o, u));
+            let e = (a - b).abs();
+            if e > worst_abs {
+                worst_abs = e;
+                worst_at = (o, u);
+            }
+        }
+        println!("max |dr| = {worst_abs:.5} at o={:.4} u={:.6}", worst_at.0, worst_at.1);
+        // r is in units of the footprint standard deviation; 0.01 sigma is far below a subpixel for any footprint
+        // that matters (and the tail u -> 1 is where the Gaussian law is sparse anyway).
+        assert!(worst_abs < 0.01, "max |dr| = {worst_abs}");
+    }
+}

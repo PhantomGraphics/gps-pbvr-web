@@ -278,6 +278,7 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "gps-core",
+ "gps-io",
  "gps-render",
  "pollster",
  "wgpu",

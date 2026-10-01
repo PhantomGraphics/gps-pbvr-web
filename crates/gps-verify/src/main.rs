@@ -3,7 +3,7 @@
 //!   gps-verify bench                 splat-parallel vs particle-parallel timing (informational)
 
 use gps_core::camera::OrbitCamera;
-use gps_render::gps::{GpsRenderer, GpuGaussian, RenderParams, RenderPath};
+use gps_render::gps::{Calibration, GpsRenderer, GpuGaussian, Method, PbvrParams, RenderParams, RenderPath};
 
 fn adapter() -> wgpu::Adapter {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -102,8 +102,55 @@ fn bench() {
     }
 }
 
+/// `gps-verify bench-ply <file.ply> [WxH] [spp_side]`: per-ensemble GPU time on a real 3DGS file for each method.
+fn bench_ply(path: &str, size: &str, spp: u32) {
+    let bytes = std::fs::read(path).expect("read ply");
+    let g = gps_io::load_ply(&bytes).expect("load ply");
+    let gpu: Vec<GpuGaussian> = (0..g.count).map(|i| GpuGaussian::from_activated(&g.activated(i))).collect();
+    let adapter = adapter();
+    println!("adapter: {} | {} Gaussians, SH degree {}", adapter.get_info().name, g.count, g.sh_degree);
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: adapter.limits(), ..Default::default() })).expect("device");
+    let (w, h) = size.split_once('x').map(|(a, b)| (a.parse().unwrap_or(480), b.parse().unwrap_or(270))).unwrap_or((480, 270));
+    let mut r = GpsRenderer::new(device, queue, wgpu::TextureFormat::Rgba8Unorm, w, h, spp).expect("renderer");
+    if g.sh_degree > 0 {
+        r.set_gaussians_sh(&gpu, &g.sh_rest, g.sh_degree as u32).expect("scene");
+    } else {
+        r.set_gaussians(&gpu).expect("scene");
+    }
+    let pts = gpu.iter().map(|p| glam::DVec3::new(p.pos_opacity[0] as f64, p.pos_opacity[1] as f64, p.pos_opacity[2] as f64));
+    let (c, rad) = OrbitCamera::robust_sphere(pts).expect("non-empty");
+    println!("{:<34} {:>13} {:>10} {:>12}", "view / method", "points/ens", "ms/ens", "truncated");
+    let env_max: u32 = std::env::var("MAXPTS").ok().and_then(|v| v.parse().ok()).unwrap_or(16384);
+    for (vname, dist_mul) in [("near (x1.25)", 1.0), ("mid (x2.3)", 1.85), ("far (x4)", 3.2)] {
+        let mut cam = OrbitCamera { up: -glam::DVec3::Y, pitch: 0.25, yaw: 0.6, ..Default::default() };
+        cam.frame_sphere(c, rad);
+        cam.distance *= dist_mul;
+        let cam = cam.to_camera(w, h);
+        for (mname, method, cal, radial) in [("GPS", Method::Gps, Calibration::PerSplatFootprint, false), ("PBVR Ext C3+R", Method::Extinction, Calibration::PerSplatFootprint, true)] {
+            let p = RenderParams { spp_side: spp, max_points_per_splat: env_max, method, pbvr: PbvrParams { calibration: cal, radial_correction: radial, ..Default::default() }, ..Default::default() };
+            r.render_ensembles(&cam, &p, 1, 1).expect("warmup");
+            r.wait_idle();
+            r.reset_stats();
+            let t = std::time::Instant::now();
+            let reps = 6;
+            for i in 0..reps {
+                r.render_ensembles(&cam, &p, 100 + i, 1).expect("render");
+                r.wait_idle();
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+            let st = pollster::block_on(r.read_stats());
+            println!("{:<34} {:>13} {:>8.1}ms {:>12}", format!("{vname} {mname}"), st.points / reps as u64, ms, st.truncated_splats / reps as u64);
+        }
+    }
+}
+
 fn main() {
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".into());
+    if which == "bench-ply" {
+        let a: Vec<String> = std::env::args().collect();
+        bench_ply(a.get(2).expect("path"), a.get(3).map(String::as_str).unwrap_or("480x270"), a.get(4).and_then(|v| v.parse().ok()).unwrap_or(1));
+        return;
+    }
     if which == "bench" {
         bench();
         return;

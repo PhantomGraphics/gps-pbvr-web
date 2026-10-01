@@ -68,6 +68,21 @@ try {
   })()`));
   const yd = process.env.YDOWN;
   if (yd !== undefined) await set('ydown', yd === '1');
+  if (process.env.MOTION) {
+    // Orbit with pointer events for ~3 s and record the frame intervals (moving), then wait for convergence (still).
+    const measure = (ms) => ev(`(async () => { const c = document.getElementById('cv'); const r = c.getBoundingClientRect(); const x = r.left + r.width / 2, y = r.top + r.height / 2;
+      const pe = (t, dx) => c.dispatchEvent(new PointerEvent(t, { clientX: x + dx, clientY: y, pointerId: 1, bubbles: true }));
+      const iv = []; let last = performance.now(); const t0 = last; pe('pointerdown', 0); let dx = 0;
+      while (performance.now() - t0 < ${ms}) { await new Promise((r) => requestAnimationFrame(r)); const n = performance.now(); iv.push(n - last); last = n; dx += 6; pe('pointermove', dx); }
+      pe('pointerup', dx); iv.sort((a, b) => a - b);
+      return JSON.stringify({ frames: iv.length, p50: iv[Math.floor(iv.length * 0.5)], p95: iv[Math.floor(iv.length * 0.95)], moving: document.getElementById('stats').textContent.includes('移動中') }); })()`);
+    for (const lod of ['manual', 'adaptive']) {
+      await set('lod', lod); await sleep(1500); await waitAcc(8);
+      console.log('orbit (' + lod + '): ' + await measure(3000));
+      const t0 = Date.now(); const t = await waitAcc(64);
+      console.log('  converged to 64 in ' + (Date.now() - t0) + ' ms after the motion stopped; ' + t.split('\n').filter((l) => /累積|⚠|移動中/.test(l)).join(' | '));
+    }
+  }
   let bad = exceptions > 0;
   for (const [name, m, calib, radial, shv] of [['gps_sh3', 0, 3, false, 3], ['gps_sh0', 0, 3, false, 0], ['ext_c3r_sh3', 2, 3, true, 3]]) {
     await set('method', m); await set('calib', calib); await set('radial', radial); await set('sh', shv);

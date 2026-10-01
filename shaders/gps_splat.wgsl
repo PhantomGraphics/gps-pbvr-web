@@ -33,10 +33,13 @@ struct Frame {
 @group(0) @binding(6) var<storage, read_write> offsets: array<u32>;      // counts, then exclusive scan
 @group(0) @binding(7) var<storage, read_write> proj: array<vec4<f32>>;   // 2 x vec4 per splat
 @group(0) @binding(8) var<storage, read_write> info: array<u32>;         // dispatch info, see finalize
+@group(0) @binding(10) var<storage, read> radius_lut: array<f32>;         // r(o, w): 65 x 129, see gps_core::radius_lut
 @group(0) @binding(9) var<storage, read> sh_rest: array<f32>;             // SH bands 1..3, channel-major, stride cfg2.y per channel
 // stats: 0 = generated points, 1 = truncated splats, 2 = dropped points, 3 = visible splats,
 //        4 = orphan subpixels (depth written but no colour winner: pass divergence, must be 0),
-//        5 = candidate particles (PBVR, before keep tests), 6 = under-covered splats (ViewConditioned)
+//        5 = candidate particles (PBVR, before keep tests), 6 = under-covered splats (ViewConditioned),
+//        7 = ensembles skipped because the particle total would overflow u32 (cumulative),
+//        8 = running particle total of the current ensemble, 9 = overflow flag of the current ensemble (both cleared by clear_buffers)
 
 const PI: f32 = 3.14159265358979;
 const DILOG_ONE: f32 = 1.64493406684823;
@@ -99,6 +102,23 @@ fn inv_dilog(tgt: f32, hi_in: f32) -> f32 {
         y = ny;
     }
     return y;
+}
+
+// Table version of corrected_radius: bilinear in (x, w) with x = 1 - sqrt(1 - o) and w = sqrt(-ln(1 - u)).
+// Same law, ~1e-3 sigma accuracy (gps_core test), without the per-point Li2 inversion.
+fn corrected_radius_lut(o: f32, u: f32) -> f32 {
+    if (o <= 0.0) { return 0.0; }
+    let v = -log(max(1.0 - u, 5.96e-8));
+    let fo = (1.0 - sqrt(max(1.0 - min(o, 1.0), 0.0))) * 64.0;
+    let fv = min(sqrt(v) * (128.0 / 4.123105625617661), 128.0);
+    let i0 = min(u32(fo), 63u);
+    let j0 = min(u32(fv), 127u);
+    let a = fo - f32(i0);
+    let b = fv - f32(j0);
+    let k = i0 * 129u + j0;
+    let r0 = mix(radius_lut[k], radius_lut[k + 1u], b);
+    let r1 = mix(radius_lut[k + 129u], radius_lut[k + 130u], b);
+    return mix(r0, r1, a);
 }
 
 // Whitened radius of the corrected law, F(r) = 1 - Li2(o e^{-r^2/2}) / Li2(o).
@@ -233,7 +253,8 @@ fn emit_particle(gid: u32, mode: u32, mean: vec2<f32>, depth_z: f32, o: f32, l00
     let spp = spp_side * spp_side;
     let W = frame.dims.x;
     let H = frame.dims.y;
-    let r = corrected_radius(o, next());
+    var r: f32;
+    if (frame.cfg2.z == 0u) { r = corrected_radius_lut(o, next()); } else { r = corrected_radius(o, next()); }
     let th = 2.0 * PI * next();
     let wx = r * cos(th);
     let wy = r * sin(th);
@@ -294,6 +315,10 @@ fn splat_pass(gid: u32, mode: u32) {
 @compute @workgroup_size(64)
 fn clear_buffers(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = thread_index(gid, frame.cfg.w);
+    if (i == 0u) {
+        atomicStore(&stats[8], 0u);
+        atomicStore(&stats[9], 0u);
+    }
     if (i < frame.dims.x * frame.dims.y * frame.dims.z * frame.dims.z) {
         atomicStore(&depth[i], EMPTY);
         atomicStore(&winner[i], EMPTY);
@@ -438,7 +463,7 @@ fn chol_of(gid: u32) -> Chol3 {
 // One PBVR particle. Draw order (identical to the CPU oracle): z, y, x normals, [view-conditioned keep],
 // [jitter y, x], [radial keep]. a = (mean, depth, opacity), b.w = view-conditioned keep probability,
 // c = (world position, inverse 2D covariance xx), d.xy = (inverse xy, inverse yy).
-fn emit_particle_pbvr(gid: u32, mode: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>) {
+fn emit_particle_pbvr(gid: u32, mode: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>, ch_a: vec3<f32>, ch_b: vec3<f32>) {
     has_spare = false;
     let uz = normal();
     let uy = normal();
@@ -446,8 +471,7 @@ fn emit_particle_pbvr(gid: u32, mode: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f
     if (frame.pbvr.x == METHOD_VIEW_CONDITIONED) {
         if (next() >= b.w) { return; }
     }
-    let ch = chol_of(gid);
-    let world = c.xyz + vec3<f32>(ch.a.x * ux, ch.a.y * ux + ch.a.z * uy, ch.b.x * ux + ch.b.y * uy + ch.b.z * uz);
+    let world = c.xyz + vec3<f32>(ch_a.x * ux, ch_a.y * ux + ch_a.z * uy, ch_b.x * ux + ch_b.y * uy + ch_b.z * uz);
     let p = world - frame.pos.xyz;
     let cam = vec3<f32>(dot(frame.rot0.xyz, p), dot(frame.rot1.xyz, p), dot(frame.rot2.xyz, p));
     if (cam.z <= frame.prm.y) { return; }
@@ -524,9 +548,12 @@ fn prepare_pbvr(i: u32, pr: Proj, o: f32) -> u32 {
     }
     let idet = 1.0 / max(det, 1e-30);
     let g0 = splats[i * 4u];
-    proj[i * 4u + 1u].w = keep;
-    proj[i * 4u + 2u] = vec4<f32>(g0.xyz, pr.c * idet);
-    proj[i * 4u + 3u] = vec4<f32>(-pr.b * idet, pr.a * idet, 0.0, 0.0);
+    proj[i * 6u + 1u].w = keep;
+    proj[i * 6u + 2u] = vec4<f32>(g0.xyz, pr.c * idet);
+    proj[i * 6u + 3u] = vec4<f32>(-pr.b * idet, pr.a * idet, 0.0, 0.0);
+    let ch = chol_of(i);                    // cached: recomputing it per particle dominated the PBVR cost
+    proj[i * 6u + 4u] = vec4<f32>(ch.a, 0.0);
+    proj[i * 6u + 5u] = vec4<f32>(ch.b, 0.0);
     return n;
 }
 
@@ -543,13 +570,18 @@ fn prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
         let l00 = sqrt(max(pr.a, 1e-30));
         let l10 = pr.b / l00;
         let l11 = sqrt(max(pr.c - l10 * l10, 1e-30));
-        proj[i * 4u] = vec4<f32>(pr.mean, pr.depth, o);
-        proj[i * 4u + 1u] = vec4<f32>(l00, l10, l11, 1.0);
+        proj[i * 6u] = vec4<f32>(pr.mean, pr.depth, o);
+        proj[i * 6u + 1u] = vec4<f32>(l00, l10, l11, 1.0);
         if (frame.pbvr.x == 0u) {
             cnt = prepare_gps(i, pr, o);
         } else {
             cnt = prepare_pbvr(i, pr, o);
         }
+    }
+    if (cnt > 0u) {
+        // exact overflow detection of the u32 scan total (every add sees the running sum before it)
+        let before = atomicAdd(&stats[8], cnt);
+        if (before > 0xffffffffu - cnt) { atomicStore(&stats[9], 1u); }
     }
     offsets[i] = cnt;                       // scanned in place by gps_scan.wgsl
     if (i == frame.dims.w - 1u) { info[5] = cnt; }
@@ -560,7 +592,12 @@ fn prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
 // be the indirect buffer of the same pass).
 @compute @workgroup_size(1)
 fn finalize_dispatch() {
-    let total = offsets[frame.dims.w - 1u] + info[5];
+    var total = offsets[frame.dims.w - 1u] + info[5];
+    if (atomicLoad(&stats[9]) != 0u) {
+        // the total does not fit in 32 bits: skip this ensemble (counted, reported by the UI) instead of corrupting it
+        total = 0u;
+        atomicAdd(&stats[7], 1u);
+    }
     let groups = max((total + 63u) / 64u, 1u);
     let gx = min(groups, 65535u);
     let gy = (groups + gx - 1u) / gx;
@@ -588,14 +625,14 @@ fn particle_pass(gid: vec3<u32>, mode: u32) {
     if (p >= info[4]) { return; }
     let i = owner_of(p);
     let k = p - offsets[i];
-    let a = proj[i * 4u];
-    let b = proj[i * 4u + 1u];
+    let a = proj[i * 6u];
+    let b = proj[i * 6u + 1u];
     // Random access: every particle has its own stream, so no thread depends on another's draws.
     rng_state = particle_seed(i, k + 1u, frame.cfg.x);
     if (frame.pbvr.x == 0u) {
         emit_particle(i, mode, a.xy, a.z, a.w, b.x, b.y, b.z);
     } else {
-        emit_particle_pbvr(i, mode, a, b, proj[i * 4u + 2u], proj[i * 4u + 3u]);
+        emit_particle_pbvr(i, mode, a, b, proj[i * 6u + 2u], proj[i * 6u + 3u], proj[i * 6u + 4u].xyz, proj[i * 6u + 5u].xyz);
     }
 }
 

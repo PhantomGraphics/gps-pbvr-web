@@ -55,3 +55,8 @@ One-time setup: repository **Settings -> Pages -> Source: GitHub Actions**. The 
 
 `node tools-cdp-check.mjs <browser.exe> <url>/check.html` (GPU-vs-CPU checks), `node tools-cdp-session.mjs <browser.exe> <out-dir>`
 (session / reproducibility / device loss / trajectory ZIP; needs `python` for `tools-check-zip.py`).
+
+## Benchmark on a real file
+
+`cargo run --release -p gps-verify -- bench-ply <file.ply> [WxH] [spp_side]` prints GPU time per ensemble for GPS and PBVR at
+three camera distances (`MAXPTS=<n>` sets the per-splat particle cap).

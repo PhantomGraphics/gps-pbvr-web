@@ -17,7 +17,7 @@ const SLOT: u64 = 256;
 /// Ensembles encoded per submission (one uniform slot each). Kept small on purpose: with 16-64 the
 /// command buffer of a 70k-splat scene made `finish()` fail with Out of Memory on an integrated GPU.
 pub const MAX_ENSEMBLES_PER_SUBMIT: u32 = 4;
-const STATS_WORDS: usize = 8;
+const STATS_WORDS: usize = 10;
 /// Scan levels: 256^5 > u32::MAX splats, so 6 slots are more than enough.
 const MAX_SCAN_LEVELS: usize = 6;
 /// Splat count limit of the particle path: every scan level dispatches < 65536 groups (256^3 = 16.7M).
@@ -192,6 +192,8 @@ pub struct RenderParams {
     pub near: f32,
     pub background: [f32; 3],
     pub exposure: f32,
+    /// evaluate the corrected radius exactly per point (the reference) instead of through the table
+    pub exact_radius: bool,
     /// active SH degree 0..=3 (clamped to what the loaded scene provides)
     pub sh_degree: u32,
     /// ignored for the PBVR methods, which always use the particle-parallel path
@@ -210,6 +212,7 @@ impl Default for RenderParams {
             background: [0.05, 0.05, 0.08],
             exposure: 1.0,
             sh_degree: 3,
+            exact_radius: false,
             path: RenderPath::Particle,
             method: Method::Gps,
             pbvr: PbvrParams::default(),
@@ -230,6 +233,8 @@ pub struct GpuStats {
     pub candidates: u64,
     /// ViewConditioned: splats whose candidate set was too small to reach the GPS target density
     pub undercovered_splats: u64,
+    /// ensembles skipped because their particle total exceeded u32 (lower the per-splat cap / density)
+    pub skipped_ensembles: u64,
 }
 
 impl GpuStats {
@@ -242,6 +247,7 @@ impl GpuStats {
             orphan_subpixels: w[4] as u64,
             candidates: w[5] as u64,
             undercovered_splats: w[6] as u64,
+            skipped_ensembles: w[7] as u64,
         }
     }
 }
@@ -262,7 +268,7 @@ impl MemoryEstimate {
 
 pub fn estimate_memory(width: u32, height: u32, spp_side: u32, n_splats: usize) -> MemoryEstimate {
     let sub = width as u64 * height as u64 * (spp_side * spp_side) as u64;
-    MemoryEstimate { depth_winner_bytes: 8 * sub, accum_bytes: 16 * width as u64 * height as u64, splat_bytes: 132 * n_splats as u64 }
+    MemoryEstimate { depth_winner_bytes: 8 * sub, accum_bytes: 16 * width as u64 * height as u64, splat_bytes: 164 * n_splats as u64 }
 }
 
 /// (groups_x, groups_y, stride in threads) covering `n` threads with 64-thread groups, staying
@@ -285,6 +291,8 @@ pub struct GpsRenderer {
     centroid: glam::DVec3,
     /// SH bands 1..3 (channel-major, `sh_stride` coefficients per channel); a dummy when the scene has none
     sh_rest: wgpu::Buffer,
+    /// tabulated corrected-radius law (see `gps_core::radius_lut`)
+    radius_lut: wgpu::Buffer,
     sh_max_degree: u32,
     sh_stride: u32,
     target_format: wgpu::TextureFormat,
@@ -375,6 +383,7 @@ impl GpsRenderer {
                 storage_entry(7, false),
                 storage_entry(8, false),
                 storage_entry(9, true),
+                storage_entry(10, true),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("gps layout"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
@@ -499,6 +508,14 @@ impl GpsRenderer {
         });
         let scan_dummy = tiny("scan dummy");
         let sh_rest = tiny("sh");
+        let lut = gps_core::radius_lut();
+        let radius_lut = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("radius lut"),
+            size: (lut.len() * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&radius_lut, 0, bytemuck::cast_slice(&lut));
         let stats_staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("stats staging"),
             size: (STATS_WORDS * 4) as u64,
@@ -514,7 +531,7 @@ impl GpsRenderer {
             ],
         });
         let mut r = Self {
-            device, queue, width, height, spp_side, n_splats: 0, centroid: glam::DVec3::ZERO, sh_rest, sh_max_degree: 0, sh_stride: 0, target_format, bgl, pl_clear, pl_depth, pl_color, pl_resolve, pl_composite,
+            device, queue, width, height, spp_side, n_splats: 0, centroid: glam::DVec3::ZERO, sh_rest, radius_lut, sh_max_degree: 0, sh_stride: 0, target_format, bgl, pl_clear, pl_depth, pl_color, pl_resolve, pl_composite,
             composite_bgl, uniform, splats, depth, winner, accum, stats, composite_uniform, bind_groups: Vec::new(), composite_bg, accumulated: 0,
             pl_prepare, pl_finalize, pl_pdepth, pl_pcolor, pl_scan, pl_scan_add, scan_bgl, offsets, proj, info, args, scan_params, scan_dummy,
             scan_sizes: Vec::new(), scan_bufs: Vec::new(), scan_bgs: Vec::new(),
@@ -535,7 +552,7 @@ impl GpsRenderer {
         let m = estimate_memory(w, h, spp_side, n_splats);
         let bind_max = lim.max_storage_buffer_binding_size as u64;
         let buf_max = lim.max_buffer_size;
-        for (name, bytes) in [("depth", m.depth_winner_bytes / 2), ("accum", m.accum_bytes), ("splats", 64 * n_splats as u64), ("projection", 64 * n_splats as u64)] {
+        for (name, bytes) in [("depth", m.depth_winner_bytes / 2), ("accum", m.accum_bytes), ("splats", 64 * n_splats as u64), ("projection", 96 * n_splats as u64)] {
             if bytes > bind_max.min(buf_max) {
                 return Err(format!(
                     "{name} buffer needs {:.0} MiB, above this device's limit of {:.0} MiB; reduce resolution / SPP / splat count",
@@ -591,6 +608,7 @@ impl GpsRenderer {
                         wgpu::BindGroupEntry { binding: 7, resource: self.proj.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 8, resource: self.info.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 9, resource: self.sh_rest.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 10, resource: self.radius_lut.as_entire_binding() },
                     ],
                 })
             })
@@ -672,7 +690,7 @@ impl GpsRenderer {
         self.sh_stride = sh_stride;
         self.splats = self.buffer("splats", bytes);
         self.offsets = self.buffer("offsets", data.len() as u64 * 4);
-        self.proj = self.buffer("proj", data.len() as u64 * 64);
+        self.proj = self.buffer("proj", data.len() as u64 * 96);
         self.info = self.buffer("info", 64);
         if !data.is_empty() {
             self.queue.write_buffer(&self.splats, 0, bytemuck::cast_slice(data));
@@ -772,10 +790,8 @@ impl GpsRenderer {
 
         // Same convention as the CPU oracle: a principal point of exactly (0,0) means "image centre".
         let (cx, cy) = if cam.cx == 0.0 && cam.cy == 0.0 { (0.5 * self.width as f64, 0.5 * self.height as f64) } else { (cam.cx, cam.cy) };
-        // Keep the scan total inside u32: n_splats * cap <= u32::MAX. A tighter cap is reported through
-        // the truncation counters like any other cap, never silently.
-        let cap_limit = (u32::MAX as u64 / self.n_splats.max(1) as u64).max(1) as u32;
-        let max_points = params.max_points_per_splat.max(1).min(cap_limit);
+        // The scan total is u32; the shader detects an overflowing total exactly and skips (and counts) that ensemble.
+        let max_points = params.max_points_per_splat.max(1);
         let r = cam.view_rot.transpose(); // columns of the transpose = rows of view_rot
         let rows = [r.col(0), r.col(1), r.col(2)];
         let (method, pb) = (params.method, &params.pbvr);
@@ -802,7 +818,7 @@ impl GpsRenderer {
                 intr: [cam.focal_x as f32, cam.focal_y as f32, cx as f32, cy as f32],
                 dims: [self.width, self.height, self.spp_side, self.n_splats],
                 cfg: [first_seed.wrapping_add(e), max_points, stride_splat, stride_sub],
-                cfg2: [stride_pix, self.sh_stride, 0, 0],
+                cfg2: [stride_pix, self.sh_stride, params.exact_radius as u32, 0],
                 prm: [params.density_scale, params.near, 0.0, 0.0],
                 bg: [params.background[0], params.background[1], params.background[2], 0.0],
                 pbvr: [method.index(), pb.calibration as u32, flags, params.sh_degree.min(self.sh_max_degree)],

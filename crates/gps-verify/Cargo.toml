@@ -9,3 +9,4 @@ pollster = "0.4"
 glam = { workspace = true }
 gps-core = { path = "../gps-core" }
 gps-render = { path = "../gps-render" }
+gps-io = { path = "../gps-io" }
