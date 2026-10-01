@@ -38,7 +38,7 @@
     <h1>GPS × PBVR — Gaussian Point Splatting (WebGPU)</h1>
     <div class="hint" id="env"></div>
     <div id="stage"><canvas id="cv" width="1280" height="720"></canvas></div>
-    <p class="hint">左ドラッグ: 回転 / 右ドラッグ・中ボタン・Shift+ドラッグ: 平行移動 / ホイール: ズーム。カメラ・設定・データを変えると累積がリセットされ、静止すると収束します。</p>
+    <p class="hint">左ドラッグ: 回転 / 右ドラッグ・中ボタン・Shift+ドラッグ・矢印キー・「移動モード」: 平行移動 / ホイール・ピンチ: ズーム（2本指: 移動+ズーム）。カメラ・設定・データを変えると累積がリセットされ、静止すると収束します。</p>
   </div>
   <aside>
     <section>
@@ -97,7 +97,8 @@
     </section>
     <section>
       <h2>操作</h2>
-      <div class="row"><button id="reset">視点と累積をリセット</button><button id="save" class="secondary">PNG保存</button></div>
+      <div class="row"><button id="panmode" class="secondary">移動モード: OFF（ドラッグで回転）</button></div>
+      <div class="row" style="margin-top:6px"><button id="reset">視点と累積をリセット</button><button id="save" class="secondary">PNG保存</button></div>
     </section>
     <section>
       <h2>再現・出力</h2>
@@ -126,8 +127,11 @@
     throw new Error('no WebGPU');
   }
   $('env').textContent = navigator.userAgent;
-  const { default: init, Viewer } = await import('./pkg/gps_web.js');
-  await init();
+  // BUILD is stamped by build-dist.ps1; a local run uses the current time so a stale cached wasm/js pair cannot be mixed.
+  const BUILD = '__BUILD__'.startsWith('__') ? String(Date.now()) : '__BUILD__';
+  const { default: init, Viewer } = await import('./pkg/gps_web.js?v=' + BUILD);
+  await init({ module_or_path: new URL('./pkg/gps_web_bg.wasm?v=' + BUILD, import.meta.url) });
+  $('env').textContent += '  |  build ' + ('__BUILD__'.startsWith('__') ? 'dev' : '__BUILD__');
   let cv = $('cv');
   let viewer;
   let busy = false;                       // trajectory export / re-initialisation in progress: ignore camera input
@@ -256,25 +260,59 @@
   $('demo').onclick = () => { try { msg(viewer.load_demo(), 'ok'); scene = { kind: 'demo', name: 'demo', bytes: null }; syncSh(); $('ydown').checked = false; } catch (e) { msg('' + e, 'err'); } };
 
   // ------------------------------------------------------------------ canvas input
+  // Navigation: left drag = orbit; right / middle drag, Shift+drag, or the "移動モード" toggle = pan;
+  // two fingers = pan + pinch zoom; arrow keys = pan; wheel = zoom. The pan decision is re-evaluated on every
+  // move (mouse buttons / Shift can change mid-drag) instead of only at pointerdown.
+  let panMode = false;
   const bindCanvas = () => {
-    let drag = null;
-    let pan = false;
+    const pts = new Map();               // active pointers: id -> [x, y]
+    let gesture = null;                  // two-finger state
     cv.addEventListener('contextmenu', (e) => e.preventDefault());
+    cv.addEventListener('auxclick', (e) => e.preventDefault());
+    cv.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });   // no middle-click autoscroll
+    const height = () => cv.getBoundingClientRect().height;
     cv.addEventListener('pointerdown', (e) => {
-      drag = [e.clientX, e.clientY];
-      pan = e.button === 2 || e.button === 1 || e.shiftKey;   // right / middle button or Shift+drag = translate
+      pts.set(e.pointerId, [e.clientX, e.clientY]);
       try { cv.setPointerCapture(e.pointerId); } catch {}
+      if (pts.size === 2) {
+        const [a, b] = [...pts.values()];
+        gesture = { cx: (a[0] + b[0]) / 2, cy: (a[1] + b[1]) / 2, d: Math.hypot(a[0] - b[0], a[1] - b[1]) };
+      }
     });
-    cv.addEventListener('pointerup', () => { drag = null; });
+    const end = (e) => { pts.delete(e.pointerId); if (pts.size < 2) gesture = null; };
+    cv.addEventListener('pointerup', end);
+    cv.addEventListener('pointercancel', end);
     cv.addEventListener('pointermove', (e) => {
-      if (!drag || busy) return;
-      // CSS pixels, so the rotation speed does not depend on the internal resolution
-      if (pan) viewer.pan(e.clientX - drag[0], e.clientY - drag[1], cv.getBoundingClientRect().height);
-      else viewer.orbit(e.clientX - drag[0], e.clientY - drag[1]);
-      drag = [e.clientX, e.clientY];
+      const prev = pts.get(e.pointerId);
+      if (!prev || busy) return;
+      const dx = e.clientX - prev[0], dy = e.clientY - prev[1];
+      pts.set(e.pointerId, [e.clientX, e.clientY]);
+      if (pts.size >= 2 && gesture) {
+        const [a, b] = [...pts.values()];
+        const c = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+        viewer.pan(c[0] - gesture.cx, c[1] - gesture.cy, height());
+        if (d > 0 && gesture.d > 0) viewer.zoom(Math.log(gesture.d / d) * 1000);   // pinch out = zoom in
+        gesture = { cx: c[0], cy: c[1], d };
+        return;
+      }
+      // CSS pixels, so the speed does not depend on the internal resolution
+      const pan = panMode || (e.buttons & 6) !== 0 || e.shiftKey;
+      if (pan) viewer.pan(dx, dy, height()); else viewer.orbit(dx, dy);
     });
     cv.addEventListener('wheel', (e) => { e.preventDefault(); if (!busy) viewer.zoom(e.deltaY); }, { passive: false });
   };
+  document.addEventListener('keydown', (e) => {
+    if (busy || e.target.closest?.('input, select, textarea, button')) return;
+    const step = { ArrowLeft: [-24, 0], ArrowRight: [24, 0], ArrowUp: [0, -24], ArrowDown: [0, 24] }[e.key];
+    if (!step) return;
+    e.preventDefault();
+    viewer.pan(step[0], step[1], cv.getBoundingClientRect().height);
+  });
+  $('panmode').addEventListener('click', () => {
+    panMode = !panMode;
+    $('panmode').textContent = panMode ? '移動モード: ON（ドラッグで平行移動）' : '移動モード: OFF（ドラッグで回転）';
+    $('panmode').classList.toggle('secondary', !panMode);
+  });
   bindCanvas();
 
   // ------------------------------------------------------------------ outputs: PNG / JSON / CSV

@@ -54,7 +54,12 @@ One-time setup: repository **Settings -> Pages -> Source: GitHub Actions**. The 
 ## Browser tests
 
 `node tools-cdp-check.mjs <browser.exe> <url>/check.html` (GPU-vs-CPU checks), `node tools-cdp-session.mjs <browser.exe> <out-dir>`
-(session / reproducibility / device loss / trajectory ZIP; needs `python` for `tools-check-zip.py`).
+(session / reproducibility / device loss / trajectory ZIP; needs `python` for `tools-check-zip.py`),
+`node tools-cdp-input.mjs <browser.exe>` (trusted mouse / key / touch input: orbit, pan, pinch).
+
+Navigation: left drag = orbit; right / middle drag, Shift+drag, arrow keys or the "移動モード" toggle = pan; wheel = zoom;
+two fingers = pan + pinch zoom. The page shows its build stamp next to the user agent (the js/wasm pair is loaded with a
+matching `?v=` so a stale cache cannot mix versions).
 
 ## Benchmark on a real file
 
