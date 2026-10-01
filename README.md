@@ -24,5 +24,8 @@ Native checks: `cargo test --release --workspace` and `cargo run --release -p gp
 Browser checks: open `web/check.html` (or `node tools-cdp-check.mjs <browser.exe> <url>`).
 
 WebGPU needs HTTPS or localhost. Methods: GPS, PBVR Proportional / Extinction / ViewConditioned
-(calibration C0-C3, C3+R). `tests/cpp_reference` regenerates the C++ reference fixtures and needs the
-Phantom C++ sources (this repo is meant to be checked out at `web/gps-pbvr` of the parent project).
+(calibration C0-C3, C3+R).
+
+`tests/fixtures/cpp_*.f64` are outputs of the original C++ implementation, checked in so that
+`cargo test` (the `cpp_crosscheck` test) is self-contained. They are generated and owned by the
+Crystal2024 parent project, not by this repository.
