@@ -12,8 +12,15 @@
   main { display:grid; grid-template-columns: minmax(0,1fr) 320px; gap:16px; padding:16px; max-width:1700px; margin:0 auto; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
   h1 { font-size:18px; margin:0 0 4px; }
-  #stage { background:#000; border:1px solid var(--line); border-radius:6px; overflow:hidden; line-height:0; }
-  canvas { width:100%; height:auto; display:block; touch-action:none; cursor:grab; }
+  #stage { position:relative; background:#000; border:1px solid var(--line); border-radius:6px; overflow:hidden; line-height:0; display:flex; justify-content:center; align-items:center; }
+  canvas { width:100%; height:auto; display:block; touch-action:none; cursor:grab; }   /* layoutCanvas() sets the exact fitted size */
+  #hud { position:absolute; left:8px; bottom:6px; font:12px/1.4 ui-monospace,Consolas,monospace; color:#dfe6ec; background:rgba(0,0,0,.45); padding:2px 6px; border-radius:4px; pointer-events:none; display:none; }
+  body.nopanel #hud, #stage:fullscreen #hud { display:block; }
+  #viewbtns { position:fixed; top:8px; right:8px; z-index:10; display:flex; gap:6px; }
+  #viewbtns button { background:rgba(20,23,26,.72); color:#fff; border:1px solid rgba(255,255,255,.25); padding:4px 9px; font-size:12px; }
+  body.nopanel main { grid-template-columns:minmax(0,1fr); max-width:none; padding:8px; gap:0; }
+  body.nopanel aside, body.nopanel h1, body.nopanel #env, body.nopanel p.hint { display:none; }
+  #stage:fullscreen { border:0; border-radius:0; }
   canvas:active { cursor:grabbing; }
   aside { display:flex; flex-direction:column; gap:12px; }
   section { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px 12px; }
@@ -33,11 +40,12 @@
 </style>
 </head>
 <body>
+<div id="viewbtns"><button id="panelbtn" title="P">パネルを閉じる ▶</button><button id="fsbtn" title="F">全画面</button></div>
 <main>
   <div>
     <h1>GPS × PBVR — Gaussian Point Splatting (WebGPU)</h1>
     <div class="hint" id="env"></div>
-    <div id="stage"><canvas id="cv" width="1280" height="720"></canvas></div>
+    <div id="stage"><canvas id="cv" width="1280" height="720"></canvas><div id="hud"></div></div>
     <p class="hint">左ドラッグ: 回転 / 右ドラッグ・中ボタン・Shift+ドラッグ・矢印キー・「移動モード」: 平行移動 / ホイール・ピンチ: ズーム（2本指: 移動+ズーム）。カメラ・設定・データを変えると累積がリセットされ、静止すると収束します。</p>
   </div>
   <aside>
@@ -145,12 +153,44 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   };
 
+  // ------------------------------------------------------------------ layout: use the whole window
+  // The canvas is sized to the largest rectangle with the internal aspect ratio that fits the free area, so pointer
+  // distances map 1:1 to image pixels (no letterbox inside the element). The side panel can be closed (P) and the
+  // stage can go full screen (F); the choice is remembered.
+  const layoutCanvas = () => {
+    const stage = $('stage');
+    const fs = document.fullscreenElement === stage;
+    const aspect = cv.width / cv.height;
+    const availW = fs ? innerWidth : stage.clientWidth;
+    const top = fs ? 0 : stage.getBoundingClientRect().top + scrollY;
+    const availH = Math.max(200, fs ? innerHeight : innerHeight - top - (document.body.classList.contains('nopanel') ? 12 : 56));
+    const w = Math.floor(Math.min(availW, availH * aspect));
+    cv.style.width = w + 'px';
+    cv.style.height = Math.floor(w / aspect) + 'px';
+  };
+  const setPanel = (open) => {
+    document.body.classList.toggle('nopanel', !open);
+    $('panelbtn').textContent = open ? 'パネルを閉じる ▶' : '◀ パネルを開く';
+    try { localStorage.setItem('gps.panel', open ? '1' : '0'); } catch {}
+    layoutCanvas();
+  };
+  $('panelbtn').addEventListener('click', () => setPanel(document.body.classList.contains('nopanel')));
+  $('fsbtn').addEventListener('click', () => { if (document.fullscreenElement) document.exitFullscreen(); else $('stage').requestFullscreen?.().catch((e) => { msg('全画面にできません: ' + e, 'err'); window.__fsError = String(e); }); });
+  addEventListener('resize', layoutCanvas);
+  document.addEventListener('fullscreenchange', layoutCanvas);
+  new ResizeObserver(layoutCanvas).observe($('stage').parentElement);
+  document.addEventListener('keydown', (e) => {
+    if (e.target.closest?.('input, select, textarea') || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === 'p' || e.key === 'P') $('panelbtn').click();
+    else if (e.key === 'f' || e.key === 'F') $('fsbtn').click();
+  });
+
   // ------------------------------------------------------------------ settings
   const apply = () => {
     const [w, h] = $('res').value.split('x').map(Number);
     const density = Math.pow(10, parseFloat($('density').value));
     $('densityv').textContent = density.toFixed(2);
-    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; layoutCanvas(); }
     try {
       viewer.configure(w, h, +$('spp').value, density, +$('perframe').value, +$('target').value, +$('maxpts').value);
       msg('');
@@ -424,7 +464,7 @@
     try {
       const session = getSession();
       const fresh = cv.cloneNode(false);          // a canvas that already had a WebGPU context cannot be reused
-      cv.replaceWith(fresh); cv = fresh; bindCanvas();
+      cv.replaceWith(fresh); cv = fresh; bindCanvas(); layoutCanvas();
       viewer = await Viewer.create(cv);
       if (scene.kind === 'ply') viewer.load_ply(scene.bytes); else viewer.load_demo();
       syncSh(scene.kind === 'ply');
@@ -438,6 +478,8 @@
   // ------------------------------------------------------------------ start
   try { viewer = await Viewer.create(cv); } catch (e) { msg('初期化に失敗: ' + e, 'err'); throw e; }
   apply(); applyMethod(); applySh(); applyLod(); applySeed(); showKeys();
+  try { if (localStorage.getItem('gps.panel') === '0') setPanel(false); } catch {}
+  layoutCanvas();
   viewer.load_demo(); syncSh(); msg('デモシーンを表示中。PLY をドロップすると置き換わります。');
   $('ydown').checked = false;
 
@@ -481,6 +523,7 @@ SH ${s.sh_degree}/${s.sh_max}  ensemble/フレーム ${s.ensembles_per_frame}  s
 ⚠ 粒子総数が 32bit を超えたため ${s.skipped} ensemble を省略しました（粒子上限/密度を下げてください）`;
     if (s.orphan > 0) t += `\n⚠ 内部不整合 ${s.orphan}`;
     $('stats').textContent = t;
+    $('hud').textContent = `${s.method} · ${s.width}x${s.height} · 累積 ${s.accumulated}/${s.target} · p50 ${p(0.5)}ms${s.lod_moving ? ' · 移動中' : ''}${s.truncated_splats > 0 && !s.lod_moving ? ' · ⚠打切り' : ''}`;
   }, 500);
 </script>
 </body>

@@ -57,6 +57,9 @@ One-time setup: repository **Settings -> Pages -> Source: GitHub Actions**. The 
 (session / reproducibility / device loss / trajectory ZIP; needs `python` for `tools-check-zip.py`),
 `node tools-cdp-input.mjs <browser.exe>` (trusted mouse / key / touch input: orbit, pan, pinch).
 
+Layout: the side panel can be closed (button or `P`) and the viewer then fills the window; `F` / the button toggles full screen
+(a status line stays on the image). The choice is remembered.
+
 Navigation: left drag = orbit; right / middle drag, Shift+drag, arrow keys or the "移動モード" toggle = pan; wheel = zoom;
 two fingers = pan + pinch zoom. The page shows its build stamp next to the user agent (the js/wasm pair is loaded with a
 matching `?v=` so a stale cache cannot mix versions).
