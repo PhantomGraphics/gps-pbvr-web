@@ -44,6 +44,13 @@ Crystal2024 parent project, not by this repository.
 HTTPS with `.wasm` served as `application/wasm`. Without WebGPU the page shows an explanation; tested on Chrome / Edge 154
 (Windows, integrated GPU). Firefox / Safari are not verified yet.
 
+### GitHub Pages
+
+`.github/workflows/pages.yml` builds and deploys `dist/` on every push to `main` (it also runs `cargo test` first).
+One-time setup: repository **Settings -> Pages -> Source: GitHub Actions**. The site is then served at
+`https://<owner>.github.io/<repo>/`. The workflow pins `wasm-bindgen-cli` to the version in `Cargo.lock`
+(`WASM_BINDGEN_VERSION`); update both together.
+
 ## Browser tests
 
 `node tools-cdp-check.mjs <browser.exe> <url>/check.html` (GPU-vs-CPU checks), `node tools-cdp-session.mjs <browser.exe> <out-dir>`
