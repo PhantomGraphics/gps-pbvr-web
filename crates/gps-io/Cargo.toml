@@ -1,0 +1,9 @@
+[package]
+name = "gps-io"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+glam = { workspace = true }
+bytemuck = { workspace = true }
+gps-core = { path = "../gps-core" }

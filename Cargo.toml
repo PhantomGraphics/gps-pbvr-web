@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/gps-core", "crates/gps-io", "crates/gps-render", "crates/gps-verify", "crates/gps-web"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }

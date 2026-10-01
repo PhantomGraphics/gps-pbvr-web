@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPS x PBVR Viewer</title>
+<style>
+  :root { --bg:#fff; --fg:#14171a; --muted:#5b6670; --panel:#f3f5f7; --line:#d5dbe0; --accent:#1463c9; --bad:#b00020; --good:#0a7d2c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#101316; --fg:#e8ecef; --muted:#9aa5ae; --panel:#1a1f24; --line:#2c343b; --accent:#6aa7ff; --bad:#ff6b7f; --good:#56d27a; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  main { display:grid; grid-template-columns: minmax(0,1fr) 320px; gap:16px; padding:16px; max-width:1700px; margin:0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  h1 { font-size:18px; margin:0 0 4px; }
+  #stage { background:#000; border:1px solid var(--line); border-radius:6px; overflow:hidden; line-height:0; }
+  canvas { width:100%; height:auto; display:block; touch-action:none; cursor:grab; }
+  canvas:active { cursor:grabbing; }
+  aside { display:flex; flex-direction:column; gap:12px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px 12px; }
+  section h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 8px; }
+  label { display:flex; justify-content:space-between; align-items:center; gap:8px; margin:6px 0; }
+  input[type=range] { flex:1; min-width:0; }
+  input[type=number], select { width:92px; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:4px; padding:3px 6px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:4px; padding:6px 10px; cursor:pointer; font:inherit; }
+  button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  #drop { border:2px dashed var(--line); border-radius:6px; padding:10px; text-align:center; color:var(--muted); }
+  #drop.over { border-color:var(--accent); color:var(--fg); }
+  #stats { font:12px/1.5 ui-monospace,Consolas,monospace; margin:0; white-space:pre-wrap; }
+  #msg { min-height:1.4em; } .err { color:var(--bad); } .ok { color:var(--good); }
+  details summary { cursor:pointer; color:var(--muted); }
+  .hint { color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<main>
+  <div>
+    <h1>GPS × PBVR — Gaussian Point Splatting (WebGPU)</h1>
+    <div class="hint" id="env"></div>
+    <div id="stage"><canvas id="cv" width="1280" height="720"></canvas></div>
+    <p class="hint">ドラッグ: 回転 / ホイール: ズーム。カメラ・設定・データを変えると累積がリセットされ、静止すると収束します。</p>
+  </div>
+  <aside>
+    <section>
+      <h2>データ</h2>
+      <div id="drop">3DGS PLY をここへドロップ<br>または <input type="file" id="file" accept=".ply"></div>
+      <div class="row" style="margin-top:8px"><button id="demo" class="secondary">デモシーン</button>
+        <label style="margin:0"><input type="checkbox" id="ydown" checked> Y下向き(3DGS)</label></div>
+      <div id="msg" class="hint"></div>
+    </section>
+    <section>
+      <h2>画質</h2>
+      <label>プリセット
+        <select id="preset"><option value="light" selected>軽量（低スペックPC向け）</option><option value="standard">標準</option><option value="high">高画質</option><option value="custom">カスタム</option></select></label>
+      <label>内部解像度
+        <select id="res"><option value="320x180">320×180</option><option value="480x270" selected>480×270</option><option value="640x360">640×360</option><option value="960x540">960×540</option><option value="1280x720">1280×720</option><option value="1920x1080">1920×1080</option></select></label>
+      <label>SPP (一辺)
+        <select id="spp"><option selected>1</option><option>2</option><option>3</option><option>4</option></select></label>
+      <label>密度 <input type="range" id="density" min="-2" max="2" step="0.05" value="0"><span id="densityv" style="width:3.5em;text-align:right">1.00</span></label>
+      <label>SH 次数
+        <select id="sh"><option value="0">0（基本色）</option><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option></select></label>
+      <label>ensemble LOD
+        <select id="lod"><option value="manual" selected>手動（固定）</option><option value="adaptive">適応（移動中は1）</option></select></label>
+      <label>累積目標 <input type="number" id="target" min="1" max="100000" value="32"></label>
+      <details><summary>詳細設定</summary>
+        <label>ensemble / フレーム <input type="number" id="perframe" min="1" max="4" value="1"></label>
+        <label>粒子上限 / splat <input type="number" id="maxpts" min="64" max="16777216" value="16384"></label>
+      </details>
+    </section>
+    <section>
+      <h2>方式</h2>
+      <label>粒子モデル
+        <select id="method" style="width:170px">
+          <option value="0" selected>GPS（画面空間）</option>
+          <option value="1">PBVR Proportional</option>
+          <option value="2">PBVR Extinction</option>
+          <option value="3">PBVR ViewConditioned</option>
+        </select></label>
+      <div id="pbvr-opts" hidden>
+        <label>密度較正
+          <select id="calib" style="width:170px">
+            <option value="0">C0 固定</option>
+            <option value="1">C1 物体距離</option>
+            <option value="2">C2 splat距離</option>
+            <option value="3" selected>C3 フットプリント</option>
+          </select></label>
+        <label><span>C3+R 放射補正 <span class="hint">(Extinction + C3)</span></span> <input type="checkbox" id="radial"></label>
+        <label><span>splat中心深度</span> <input type="checkbox" id="centre"></label>
+        <label><span>低域通過ジッタ</span> <input type="checkbox" id="jitter" checked></label>
+        <details><summary>較正パラメータ</summary>
+          <label>基準粒子数 K <input type="number" id="basek" min="1" max="1000000" value="512"></label>
+          <label>基準画素長 <input type="number" id="reflen" min="0.0001" max="1000" step="0.001" value="0.01"></label>
+        </details>
+      </div>
+      <div class="hint" id="methodhint">GPS: 画面空間の確率的不透明点。PBVR は 3D ガウシアンから粒子を生成します（粒子並列経路のみ）。</div>
+    </section>
+    <section>
+      <h2>操作</h2>
+      <div class="row"><button id="reset">視点と累積をリセット</button><button id="save" class="secondary">PNG保存</button><button id="savestats" class="secondary">統計保存(JSON)</button></div>
+    </section>
+    <section>
+      <h2>状態</h2>
+      <pre id="stats">-</pre>
+    </section>
+  </aside>
+</main>
+<script type="module">
+  const $ = (id) => document.getElementById(id);
+  const msg = (t, cls = '') => { $('msg').textContent = t; $('msg').className = 'hint ' + cls; };
+  if (!navigator.gpu) {
+    msg('WebGPU が利用できません（HTTPS/localhost と対応ブラウザ: Chrome/Edge 113+ が必要）', 'err');
+    throw new Error('no WebGPU');
+  }
+  $('env').textContent = navigator.userAgent;
+  const { default: init, Viewer } = await import('./pkg/gps_web.js');
+  await init();
+  const cv = $('cv');
+  let viewer;
+  try { viewer = await Viewer.create(cv); } catch (e) { msg('初期化に失敗: ' + e, 'err'); throw e; }
+
+  const apply = () => {
+    const [w, h] = $('res').value.split('x').map(Number);
+    const density = Math.pow(10, parseFloat($('density').value));
+    $('densityv').textContent = density.toFixed(2);
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    try {
+      viewer.configure(w, h, +$('spp').value, density, +$('perframe').value, +$('target').value, +$('maxpts').value);
+      msg('');
+    } catch (e) { msg('設定を適用できません: ' + e, 'err'); }
+  };
+  // Quality presets. Lighter presets lower resolution / subpixels / convergence target rather than the
+  // point density, which would bias the image (fainter) instead of just making it coarser.
+  const PRESETS = {
+    light:    { res: '480x270',  spp: '1', target: 32,  maxpts: 16384 },
+    standard: { res: '640x360',  spp: '1', target: 64,  maxpts: 65536 },
+    high:     { res: '1280x720', spp: '2', target: 256, maxpts: 65536 },
+  };
+  const applyPreset = () => {
+    const p = PRESETS[$('preset').value];
+    if (!p) return;
+    $('res').value = p.res; $('spp').value = p.spp; $('target').value = p.target; $('maxpts').value = p.maxpts;
+    $('density').value = 0; apply();
+  };
+  $('preset').addEventListener('change', applyPreset);
+  for (const id of ['res', 'spp', 'density', 'target', 'perframe', 'maxpts']) {
+    $(id).addEventListener('change', () => { $('preset').value = 'custom'; apply(); });
+  }
+  $('density').addEventListener('input', () => { $('preset').value = 'custom'; apply(); });
+  const HINTS = [
+    'GPS: 画面空間の確率的不透明点。PBVR は 3D ガウシアンから粒子を生成します（粒子並列経路のみ）。',
+    'Proportional: 粒子数 ∝ 不透明度。透過の合成則とは一致しないため GPS より薄く/濃くなります。',
+    'Extinction: 粒子数 ∝ −ln(1−α)。C3 + 放射補正(C3+R)で GPS の投影強度に一致します。',
+    'ViewConditioned: Extinction 候補を GPS 目標密度へ間引く。K が小さいと目標に届かない splat が出ます（状態欄に警告）。',
+  ];
+  const applyMethod = () => {
+    const m = +$('method').value;
+    $('pbvr-opts').hidden = m === 0;
+    $('methodhint').textContent = HINTS[m];
+    $('calib').disabled = m === 3;           // ViewConditioned ignores the calibration level
+    const radialOk = m === 2 && $('calib').value === '3';
+    $('radial').disabled = !radialOk;
+    viewer.set_method(m, +$('calib').value, $('radial').checked && radialOk, $('centre').checked, $('jitter').checked, +$('basek').value, +$('reflen').value);
+  };
+  for (const id of ['method', 'calib', 'radial', 'centre', 'jitter', 'basek', 'reflen']) $(id).addEventListener('change', applyMethod);
+  applyMethod();
+  const syncSh = (useMax = false) => {
+    const mx = viewer.sh_max_degree();
+    if (useMax) $('sh').value = String(mx);
+    for (const o of $('sh').options) o.disabled = +o.value > mx;
+    if (+$('sh').value > mx) $('sh').value = String(mx);
+    viewer.set_sh_degree(+$('sh').value);
+  };
+  const applySh = () => viewer.set_sh_degree(+$('sh').value);
+  const applyLod = () => viewer.set_lod($('lod').value === 'adaptive', 33.3);
+  $('sh').addEventListener('change', applySh);
+  $('lod').addEventListener('change', () => { applyLod(); $('perframe').disabled = $('lod').value === 'adaptive'; });
+  applySh(); applyLod();
+  $('ydown').addEventListener('change', () => viewer.set_y_down($('ydown').checked));
+  $('reset').onclick = () => viewer.reset_view();   // camera back to the load-time framing + restart accumulation
+
+  const loadBytes = async (file) => {
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const info = viewer.load_ply(buf);
+      $('ydown').checked = true;
+      syncSh(true);
+      msg(`${file.name}: ${info}`, 'ok');
+    } catch (e) { msg(`${file.name}: ${e}`, 'err'); }
+  };
+  $('file').addEventListener('change', (e) => e.target.files[0] && loadBytes(e.target.files[0]));
+  const drop = $('drop');
+  drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+  drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); e.dataTransfer.files[0] && loadBytes(e.dataTransfer.files[0]); });
+  $('demo').onclick = () => { try { msg(viewer.load_demo(), 'ok'); syncSh(); $('ydown').checked = false; } catch (e) { msg('' + e, 'err'); } };
+
+  let drag = null;
+  cv.addEventListener('pointerdown', (e) => { drag = [e.clientX, e.clientY]; try { cv.setPointerCapture(e.pointerId); } catch {} });
+  cv.addEventListener('pointerup', () => { drag = null; });
+  cv.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    // CSS pixels, so the rotation speed does not depend on the internal resolution
+    viewer.orbit(e.clientX - drag[0], e.clientY - drag[1]);
+    drag = [e.clientX, e.clientY];
+  });
+  cv.addEventListener('wheel', (e) => { e.preventDefault(); viewer.zoom(e.deltaY); }, { passive: false });
+
+  // Stats for comparing methods: downloads the current state and counters as JSON.
+  $('savestats').onclick = () => {
+    const s = JSON.parse(viewer.stats_json());
+    s.settings = { method: $('method').value, calibration: $('calib').value, radial: $('radial').checked, centre_depth: $('centre').checked,
+      jitter: $('jitter').checked, base_k: +$('basek').value, reference_pixel_length: +$('reflen').value, density: $('densityv').textContent,
+      resolution: $('res').value, spp_side: $('spp').value };
+    s.frame_ms = { p50: [...ms].sort((a, b) => a - b)[Math.floor(ms.length * 0.5)] ?? null };
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' }));
+    a.download = `stats_${s.method.replace(/\s+/g, '_')}_${s.accumulated}spf.json`; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+  $('save').onclick = () => {
+    viewer.redraw();
+    viewer.frame(performance.now());   // present in this task so toBlob sees it
+    cv.toBlob((b) => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(b); a.download = `${$('method').selectedOptions[0].text.split('（')[0].replace(/\s+/g, '_')}_${viewer.accumulated()}spf.png`; a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    });
+  };
+
+  apply();
+  viewer.load_demo(); syncSh(); msg('デモシーンを表示中。PLY をドロップすると置き換わります。');
+  $('ydown').checked = false;
+
+  let ms = [];
+  let last = performance.now();
+  const tick = () => {
+    try { viewer.frame(performance.now()); } catch (e) { msg('' + e, 'err'); }
+    const now = performance.now(); ms.push(now - last); last = now; if (ms.length > 120) ms.shift();
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+
+  setInterval(async () => {
+    const s = JSON.parse(viewer.stats_json());
+    const sorted = [...ms].sort((a, b) => a - b);
+    const p = (q) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))].toFixed(1) : '-';
+    let t = `${s.scene}\n${s.width}x${s.height}  SPP ${s.spp}\n累積 ${s.accumulated}/${s.target}\n`
+          + `粒子数/ensemble ${s.accumulated > 0 ? Math.round(s.points / s.accumulated).toLocaleString() : '-'}  可視splat ${s.accumulated > 0 ? Math.round(s.visible / s.accumulated).toLocaleString() : '-'}\n`
+          + `フレーム間隔 p50 ${p(0.5)}ms p95 ${p(0.95)}ms\nGPUバッファ推定 ${s.memory_mib} MiB
+SH ${s.sh_degree}/${s.sh_max}  ensemble/フレーム ${s.ensembles_per_frame}
+カメラ yaw ${s.yaw} pitch ${s.pitch} dist ${s.distance}`;
+    if (s.method !== 'GPS') t += `
+方式 ${s.method}  候補粒子/ensemble ${s.accumulated > 0 ? Math.round(s.candidates / s.accumulated).toLocaleString() : '-'}`;
+    if (s.undercovered > 0) t += `
+⚠ 候補粒子が GPS 目標に届かない splat が ${Math.round(s.undercovered / Math.max(s.accumulated, 1))} 個/ensemble（基準粒子数 K を増やしてください）`;
+    if (s.truncated_splats > 0) t += `\n⚠ 粒子上限で ${s.truncated_splats} splat を打切り（${s.dropped_points.toLocaleString()} 点）。品質が変わっています`;
+    if (s.orphan > 0) t += `\n⚠ 内部不整合 ${s.orphan}`;
+    $('stats').textContent = t;
+  }, 500);
+</script>
+</body>
+</html>

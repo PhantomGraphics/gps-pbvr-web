@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPS x PBVR - GPU self-check</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; background: #fff; color: #111; }
+  pre { background: #f4f4f4; padding: 12px; overflow-x: auto; white-space: pre-wrap; }
+  #status.pass { color: #0a7d2c; } #status.fail { color: #b00020; }
+  @media (prefers-color-scheme: dark) { body { background: #111; color: #eee; } pre { background: #222; } }
+</style>
+</head>
+<body>
+<h1>GPS x PBVR — WebGPU self-check (Phase 0 + 2 + 3 + 4)</h1>
+<p id="env"></p>
+<p><button id="run">Run checks</button> <strong id="status">idle</strong></p>
+<pre id="report"></pre>
+<script type="module">
+  const $ = (id) => document.getElementById(id);
+  $('env').textContent = navigator.userAgent;
+  if (!navigator.gpu) {
+    $('status').textContent = 'FAIL: WebGPU unavailable (navigator.gpu missing; needs HTTPS or localhost and a supporting browser)';
+    $('status').className = 'fail';
+  } else {
+    const { default: init, run_phase0, run_phase2, run_phase3, run_phase4 } = await import('./pkg/gps_web.js');
+    await init();
+    const run = async () => {
+      $('status').textContent = 'running...'; $('status').className = '';
+      const r0 = await run_phase0();
+      $('report').textContent = r0;
+      const r2 = await run_phase2();
+      $('report').textContent = [r0, r2].join(String.fromCharCode(10));
+      const r3 = await run_phase3();
+      $('report').textContent = [r0, r2, r3].join(String.fromCharCode(10));
+      const r4 = await run_phase4();
+      const report = [r0, r2, r3, r4].join(String.fromCharCode(10));
+      $('report').textContent = report;
+      const pass = r0.trimEnd().endsWith('PHASE0: PASS') && r2.trimEnd().endsWith('PHASE2: PASS') && r3.trimEnd().endsWith('PHASE3: PASS') && r4.trimEnd().endsWith('PHASE4: PASS');
+      $('status').textContent = pass ? 'PASS' : 'FAIL';
+      $('status').className = pass ? 'pass' : 'fail';
+      document.body.dataset.result = pass ? 'pass' : 'fail';
+    };
+    $('run').onclick = run;
+    run();
+  }
+</script>
+</body>
+</html>

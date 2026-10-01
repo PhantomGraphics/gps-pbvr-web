@@ -1,0 +1,11 @@
+[package]
+name = "gps-verify"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wgpu = "30.0.1"
+pollster = "0.4"
+glam = { workspace = true }
+gps-core = { path = "../gps-core" }
+gps-render = { path = "../gps-render" }

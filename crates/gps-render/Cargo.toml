@@ -1,0 +1,12 @@
+[package]
+name = "gps-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wgpu = "30.0.1"
+bytemuck = { workspace = true }
+glam = { workspace = true }
+gps-core = { path = "../gps-core" }
+gps-io = { path = "../gps-io" }
+futures-channel = "0.3"
