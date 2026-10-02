@@ -569,6 +569,41 @@ pub async fn run_phase3(adapter: &wgpu::Adapter, log: &mut dyn FnMut(String)) ->
         ok &= pass;
     }
 
+    // Reuse the same buffers across method/camera changes, without reloading the scene.
+    // A fresh renderer is the baseline; an offscreen view must contain only background.
+    {
+        let scene = &all[3].1;
+        let case = c("Extinction C3+R", Method::Extinction, Calibration::PerSplatFootprint, true, false, true);
+        let p = pbvr_params(&base, &case);
+        let expected = render_mean(&mut r, scene, &p, 8, 700).await.unwrap_or_default();
+        r.reset_accum();
+        r.render_ensembles(&camera(), &base, 900, 3).expect("GPS history");
+        r.reset_accum();
+        for seed in 700..708 {
+            r.render_ensembles(&camera(), &p, seed, 1).expect("PBVR after GPS");
+        }
+        let actual = r.read_accum().await;
+        let replay = !expected.is_empty() && actual == expected;
+        r.reset_accum();
+        let offscreen = OracleCamera { view_pos: DVec3::new(1000.0, 0.0, 0.0), ..camera() };
+        r.render_ensembles(&offscreen, &p, 800, 2).expect("offscreen PBVR");
+        let blank = r.read_accum().await;
+        let cleared = blank.iter().all(|v| v[3] == 2.0 && (0..3).all(|k| (v[k] - 2.0 * p.background[k]).abs() < 1e-6));
+        // Return from a different view and a heavily capped moving preview.
+        let moving = RenderParams { max_points_per_splat: 16, ..p };
+        let moved = OracleCamera { view_pos: DVec3::new(0.1, 0.0, 0.0), ..camera() };
+        r.reset_accum();
+        r.render_ensembles(&moved, &moving, 850, 1).expect("moving PBVR preview");
+        r.reset_accum();
+        for first in [700, 704] {
+            r.render_ensembles(&camera(), &p, first, 4).expect("stationary PBVR");
+        }
+        let restored = r.read_accum().await == expected;
+        let pass = replay && cleared && restored;
+        log(format!("[PBVR history] GPS -> PBVR / batched vs separate: {replay}; camera leaves scene / background only: {cleared}; move with cap -> stop: {restored} {}", if pass { "ok" } else { "FAIL" }));
+        ok &= pass;
+    }
+
     // Method comparison (information): per-method point counts and agreement with the analytic GPS image.
     {
         let (sname, scene) = (all[3].0, &all[3].1);
