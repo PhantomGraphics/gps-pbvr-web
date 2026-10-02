@@ -126,7 +126,7 @@ fn bench_ply(path: &str, size: &str, spp: u32) {
         cam.frame_sphere(c, rad);
         cam.distance *= dist_mul;
         let cam = cam.to_camera(w, h);
-        for (mname, method, cal, radial) in [("GPS", Method::Gps, Calibration::PerSplatFootprint, false), ("PBVR Ext C3+R", Method::Extinction, Calibration::PerSplatFootprint, true)] {
+        for (mname, method, cal, radial) in [("GPS", Method::Gps, Calibration::PerSplatFootprint, false), ("PBVR Ext C3+R", Method::Extinction, Calibration::PerSplatFootprint, true), ("Screen occupancy", Method::ScreenOccupancy, Calibration::None, false)] {
             let p = RenderParams { spp_side: spp, max_points_per_splat: env_max, method, pbvr: PbvrParams { calibration: cal, radial_correction: radial, ..Default::default() }, ..Default::default() };
             r.render_ensembles(&cam, &p, 1, 1).expect("warmup");
             r.wait_idle();
@@ -140,6 +140,9 @@ fn bench_ply(path: &str, size: &str, spp: u32) {
             let ms = t.elapsed().as_secs_f64() * 1000.0 / reps as f64;
             let st = pollster::block_on(r.read_stats());
             println!("{:<34} {:>13} {:>8.1}ms {:>12}", format!("{vname} {mname}"), st.points / reps as u64, ms, st.truncated_splats / reps as u64);
+            if method == Method::ScreenOccupancy {
+                println!("    candidate tests/ens={} skipped={} orphan={}", st.candidates / reps as u64, st.skipped_ensembles, st.orphan_subpixels);
+            }
         }
     }
 }

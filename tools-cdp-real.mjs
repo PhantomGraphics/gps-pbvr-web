@@ -72,6 +72,32 @@ try {
   const yd = process.env.YDOWN;
   if (yd !== undefined) await set('ydown', yd === '1');
   console.log('camera: ' + await ev(`JSON.stringify(window.__gps.getSession().camera)`));
+  if (process.env.SCALE_COMPARE) {
+    const base = await ev('window.__gps.getSession()');
+    const results = [];
+    for (const distanceFactor of [1, 0.45]) {
+      for (const divisor of [1, 2]) {
+        const session = structuredClone(base);
+        Object.assign(session.settings, { renderscale: String(divisor), method: '2', calib: '3',
+          radial: true, lod: 'manual', pathmode: '0', perframe: '1', target: '64', seed: '1', maxpts: '65536' });
+        session.camera.distance *= distanceFactor;
+        const start = Date.now();
+        await ev(`window.__gps.applySession(${JSON.stringify(session)})`);
+        await sleep(200); // allow the invalidation to reset the old history
+        for (let i = 0; i < 1200 && (await ev('window.__gps.accumulated()')) < 64; i++) await sleep(100);
+        const convergence_ms = Date.now() - start;
+        const stats = await ev('window.__gps.freshStats()');
+        if (stats.accumulated < 64 || stats.skipped) throw new Error('incomplete/overflowed comparison: ' + JSON.stringify(stats));
+        const png = await ev('(async () => Array.from(await window.__gps.canvasPng()))()');
+        const stem = out + '_distance' + distanceFactor + '_scale' + divisor;
+        writeFileSync(stem + '.png', Buffer.from(png));
+        results.push({ distanceFactor, divisor, convergence_ms, stats, session });
+        console.log(JSON.stringify(results.at(-1)));
+      }
+    }
+    writeFileSync(out + '_comparison.json', JSON.stringify(results, null, 2));
+    ws.close(); child.kill(); srv.close(); process.exit(exceptions ? 1 : 0);
+  }
   if (process.env.CAM) {   // JSON overrides of the orbit camera, e.g. {"distance":0.5,"yaw":1.2}
     console.log('camera override: ' + await ev(`(() => { const s = window.__gps.getSession(); Object.assign(s.camera, ${process.env.CAM}); window.__gps.applySession(s); return JSON.stringify(s.camera); })()`));
   }

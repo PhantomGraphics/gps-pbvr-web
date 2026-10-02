@@ -66,5 +66,68 @@ matching `?v=` so a stale cache cannot mix versions).
 
 ## Benchmark on a real file
 
+Experimental half-resolution mode: select **描画スケール（実験） → 半解像度＋双線形拡大**.
+The canvas/export resolution stays unchanged; particle generation and accumulation use half
+the width and height. Density and opacity are not reduced. The composite filters linear RGB
+before exposure and gamma. This baseline uses bilinear interpolation, not depth-guided
+reconstruction, so thin structures and silhouettes can soften. Scale changes reset history;
+the selected scale is saved in the session. Full resolution remains the default.
+
+Compare a real PLY at the framed and close-up cameras with identical PBVR Extinction C3+R
+settings (64 ensembles, SH unchanged): set `REAL=<path>`, `RES=1280x720`, and `SCALE_COMPARE=1`,
+then run `node tools-cdp-real.mjs <browser.exe> <out-prefix>`. The tool writes four full-size
+canvas PNGs and a comparison JSON with camera/settings, counters and convergence wall time
+(browser presentation/polling included; not an isolated GPU timestamp).
+
+Trial on `train_point_cloud.ply` (559,263 Gaussians), Intel integrated graphics:
+native PBVR Extinction C3+R, SPP=1, cap=16,384, six synchronised ensembles after
+warm-up, 1280x720 versus 640x360 internal resolution:
+
+| Camera | Full (ms/ensemble) | Half (ms/ensemble) |
+|---|---:|---:|
+| Near | 203.6 | 117.5 |
+| Mid | 70.8 | 36.9 |
+| Far | 20.7 | 12.2 |
+
+These are CPU submission + GPU completion times, excluding display composite,
+not GPU timestamps. Both modes hit the existing per-splat cap in the near/mid
+views; this is a capped practical comparison, not a proof of equal opacity or
+unbiased convergence. Browser captures with cap=65,536 and 64 ensembles preserve
+the full 1280x720 canvas and show softer lettering/railings in half mode. The
+mode is manually selected; automatic full-resolution refinement after motion
+and depth-guided upsampling are not part of this initial experiment.
+
 `cargo run --release -p gps-verify -- bench-ply <file.ply> [WxH] [spp_side]` prints GPU time per ensemble for GPS and PBVR at
 three camera distances (`MAXPTS=<n>` sets the per-splat particle cap).
+
+### Clipped screen occupancy (experimental particle reduction)
+
+Select `画面空間・被覆判定（粒子削減）` / `Method::ScreenOccupancy` (index 4).
+The method clips each projected footprint to the viewport before creating work.
+Faint footprints use uniform Poisson candidates with radial extinction rejection;
+dense footprints use one Bernoulli coverage test per subpixel. Both implement
+`P(hit) = 1 - exp(density * log(1 - alpha))`, where
+`alpha = opacity * exp(-r²/2)`. Density is not reduced to meet a budget.
+The per-splat particle cap is deliberately ignored; scan overflow remains detected.
+The footprint drops tails below 1/255 coverage. It uses projected covariance
+(including low-pass filtering) and splat-centre depth, rather than world-space
+3D particle depth. Calibration, radial/centre/jitter switches do not apply.
+It is a projected approximation, not an interchangeable 3D PBVR estimator.
+
+Train, 559,263 Gaussians, SH3, Intel integrated GPU, 1280x720, SPP1:
+
+| View | Extinction C3+R ms/ensemble | Screen occupancy ms/ensemble |
+|---|---:|---:|
+| Near | 207.5 | 152.0 |
+| Mid | 73.3 | 86.7 |
+| Far | 20.7 | 39.4 |
+
+CPU submission + GPU completion, six ensembles after warmup, excluding composite.
+Near generated-point counters fall from 57,886,950 to 5,884,944; the old counter
+includes out-of-viewport particles, while occupancy counts accepted visible hits.
+Occupancy still executes 80,558,539 candidate tests per ensemble. Existing PBVR
+hits the 16,384 per-splat cap; occupancy reports no truncation, skipped ensembles,
+or orphan subpixels. The method helps this near view but is slower at mid/far
+distances, so it remains opt-in. It can be combined with half-resolution rendering.
+GPU checks compare occupancy against analytic projected alpha and verify sparse
+and dense stream determinism. `bench-ply` now includes this method.

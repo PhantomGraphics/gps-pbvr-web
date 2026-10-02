@@ -96,6 +96,8 @@ pub struct Viewer {
     params: RenderParams,
     width: u32,
     height: u32,
+    output_width: u32,
+    output_height: u32,
     /// first ensemble seed after a reset (part of the reproducible session state)
     seed: u32,
     next_seed: u32,
@@ -192,6 +194,8 @@ impl Viewer {
             params,
             width,
             height,
+            output_width: width,
+            output_height: height,
             seed: 1,
             next_seed: 1,
             lost,
@@ -237,8 +241,8 @@ impl Viewer {
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: self.surface_format,
-                width: self.width,
-                height: self.height,
+                width: self.output_width,
+                height: self.output_height,
                 present_mode: wgpu::PresentMode::Fifo,
                 desired_maximum_frame_latency: 2,
                 color_space: wgpu::SurfaceColorSpace::Auto,
@@ -319,10 +323,24 @@ impl Viewer {
     /// Sets resolution / quality. Any change resets accumulation. Returns an error string if
     /// the device cannot hold the requested buffers (the previous settings stay active).
     pub fn configure(&mut self, width: u32, height: u32, spp_side: u32, density: f32, per_frame: u32, target: u32, max_points: u32) -> Result<(), JsValue> {
+        self.configure_scaled(width, height, 1, spp_side, density, per_frame, target, max_points)
+    }
+
+    /// Experimental low-resolution rendering, with an unchanged full-size canvas.
+    /// Density/opacity parameters are unchanged: generate particles for the new
+    /// pixel footprints instead of thinning an already generated particle set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn configure_scaled(&mut self, width: u32, height: u32, divisor: u32, spp_side: u32, density: f32, per_frame: u32, target: u32, max_points: u32) -> Result<(), JsValue> {
+        let output = (width.max(1), height.max(1));
+        let divisor = divisor.clamp(1, 2);
+        let (width, height) = (output.0.div_ceil(divisor), output.1.div_ceil(divisor));
         let spp_side = spp_side.clamp(1, 4);
         if (width, height) != (self.width, self.height) || spp_side != self.params.spp_side {
             self.renderer.resize(width, height, spp_side).map_err(js_err)?;
             (self.width, self.height) = (width, height);
+        }
+        if output != (self.output_width, self.output_height) {
+            (self.output_width, self.output_height) = output;
             self.configure_surface();
         }
         self.params.spp_side = spp_side;
@@ -335,7 +353,8 @@ impl Viewer {
     }
 
     /// Selects the particle model: `method` 0 = GPS, 1 = PBVR Proportional, 2 = PBVR Extinction,
-    /// 3 = PBVR ViewConditioned; `calibration` 0..3 = C0..C3. `radial` (C3+R) only takes effect for
+    /// 3 = PBVR ViewConditioned, 4 = clipped screen occupancy (centre depth);
+    /// `calibration` 0..3 = C0..C3. `radial` (C3+R) only takes effect for
     /// Extinction at C3 (the same rule as the C++ renderer). Resets accumulation.
     #[allow(clippy::too_many_arguments)]
     pub fn set_method(&mut self, method: u32, calibration: u32, radial: bool, centre_depth: bool, jitter: bool, base_k: f32, reference_pixel_length: f32) {

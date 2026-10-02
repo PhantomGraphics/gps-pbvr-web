@@ -111,6 +111,8 @@ pub enum Method {
     Extinction,
     /// PBVR: extinction candidates thinned so the on-screen count equals GPS (no calibration level).
     ViewConditioned,
+    /// Clipped screen-space occupancy, sparse Poisson / dense Bernoulli; centre depth.
+    ScreenOccupancy,
 }
 
 impl Method {
@@ -119,6 +121,7 @@ impl Method {
             1 => Self::Proportional,
             2 => Self::Extinction,
             3 => Self::ViewConditioned,
+            4 => Self::ScreenOccupancy,
             _ => Self::Gps,
         }
     }
@@ -131,6 +134,7 @@ impl Method {
             Self::Proportional => "PBVR Proportional",
             Self::Extinction => "PBVR Extinction",
             Self::ViewConditioned => "PBVR ViewConditioned",
+            Self::ScreenOccupancy => "Screen occupancy",
         }
     }
 }
@@ -959,7 +963,7 @@ impl GpsRenderer {
     }
 
     /// Records the composite pass into `view`, which must have this renderer's target format
-    /// and the internal resolution.
+    /// (the target may be larger; linear-space bilinear upsampling is applied).
     pub fn composite(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, params: &RenderParams) {
         let cu = CompositeUniform { width: self.width, height: self.height, exposure: params.exposure, gamma_on: params.srgb_output as u32 };
         self.queue.write_buffer(&self.composite_uniform, 0, bytemuck::bytes_of(&cu));

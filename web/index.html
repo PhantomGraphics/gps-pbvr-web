@@ -60,8 +60,10 @@
       <h2>画質</h2>
       <label>プリセット
         <select id="preset"><option value="light" selected>軽量（低スペックPC向け）</option><option value="standard">標準</option><option value="high">高画質</option><option value="custom">カスタム</option></select></label>
-      <label>内部解像度
+      <label>出力解像度
         <select id="res"><option value="320x180">320×180</option><option value="480x270" selected>480×270</option><option value="640x360">640×360</option><option value="960x540">960×540</option><option value="1280x720">1280×720</option><option value="1920x1080">1920×1080</option></select></label>
+      <label>描画スケール（実験）
+        <select id="renderscale"><option value="1" selected>全解像度</option><option value="2">半解像度＋双線形拡大</option></select></label>
       <label>SPP (一辺)
         <select id="spp"><option selected>1</option><option>2</option><option>3</option><option>4</option></select></label>
       <label>密度 <input type="range" id="density" min="-2" max="2" step="0.05" value="0"><span id="densityv" style="width:3.5em;text-align:right">1.00</span></label>
@@ -89,6 +91,7 @@
           <option value="1">PBVR Proportional</option>
           <option value="2">PBVR Extinction</option>
           <option value="3">PBVR ViewConditioned</option>
+          <option value="4">画面空間・被覆判定（粒子削減）</option>
         </select></label>
       <div id="pbvr-opts" hidden>
         <label>密度較正
@@ -197,7 +200,7 @@
     $('densityv').textContent = density.toFixed(2);
     if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; layoutCanvas(); }
     try {
-      viewer.configure(w, h, +$('spp').value, density, +$('perframe').value, +$('target').value, +$('maxpts').value);
+      viewer.configure_scaled(w, h, +$('renderscale').value, +$('spp').value, density, +$('perframe').value, +$('target').value, +$('maxpts').value);
       msg('');
     } catch (e) { msg('設定を適用できません: ' + e, 'err'); }
   };
@@ -215,7 +218,7 @@
     $('density').value = 0; apply();
   };
   $('preset').addEventListener('change', applyPreset);
-  for (const id of ['res', 'spp', 'density', 'target', 'perframe', 'maxpts']) {
+  for (const id of ['res', 'renderscale', 'spp', 'density', 'target', 'perframe', 'maxpts']) {
     $(id).addEventListener('change', () => { $('preset').value = 'custom'; apply(); });
   }
   $('density').addEventListener('input', () => { $('preset').value = 'custom'; apply(); });
@@ -227,8 +230,8 @@
   ];
   const applyMethod = () => {
     const m = +$('method').value;
-    $('pbvr-opts').hidden = m === 0;
-    $('methodhint').textContent = HINTS[m];
+    $('pbvr-opts').hidden = m === 0 || m === 4;
+    $('methodhint').textContent = m === 4 ? '画面内だけで候補生成。薄い領域は少数の抽選、濃い領域はサブピクセルの被覆判定。中心深度を使う近似。1/255未満の裾を省略。粒子上限は使用しません。' : HINTS[m];
     $('calib').disabled = m === 3;           // ViewConditioned ignores the calibration level
     const radialOk = m === 2 && $('calib').value === '3';
     $('radial').disabled = !radialOk;
@@ -257,7 +260,7 @@
   $('reset').onclick = () => viewer.reset_view();   // camera back to the load-time framing + restart accumulation
 
   // ------------------------------------------------------------------ session (reproducible state)
-  const SETTING_IDS = ['preset', 'res', 'spp', 'density', 'target', 'perframe', 'maxpts', 'movecap', 'budget', 'pathmode', 'demandthr', 'sh', 'lod', 'seed', 'method', 'calib', 'basek', 'reflen'];
+  const SETTING_IDS = ['preset', 'res', 'renderscale', 'spp', 'density', 'target', 'perframe', 'maxpts', 'movecap', 'budget', 'pathmode', 'demandthr', 'sh', 'lod', 'seed', 'method', 'calib', 'basek', 'reflen'];
   const CHECK_IDS = ['radial', 'centre', 'jitter', 'ydown', 'gamma'];
   const getSession = () => {
     const settings = {};
@@ -272,6 +275,7 @@
   const applySession = (s) => {
     if (!s || s.format !== 'gps-pbvr-session' || s.version !== 1) throw new Error('not a gps-pbvr session (format/version mismatch)');
     const st = s.settings || {};
+    $('renderscale').value = String(st.renderscale ?? 1);
     for (const id of SETTING_IDS) if (st[id] !== undefined) $(id).value = String(st[id]);
     for (const id of CHECK_IDS) if (st[id] !== undefined) $(id).checked = !!st[id];
     apply(); applyMethod(); applySh(); applyLod(); applySeed();
@@ -531,7 +535,7 @@
     const s = JSON.parse(viewer.stats_json());
     const fm = frameMsStats();
     const p = (q) => { const v = q === 0.5 ? fm.p50 : fm.p95; return v === null ? '-' : v.toFixed(1); };
-    let t = `${s.scene}\n${s.width}x${s.height}  SPP ${s.spp}\n累積 ${s.accumulated}/${s.target}\n`
+    let t = `${s.scene}\n描画 ${s.width}x${s.height} → 出力 ${cv.width}x${cv.height}  SPP ${s.spp}\n累積 ${s.accumulated}/${s.target}\n`
           + `粒子数/ensemble ${s.accumulated > 0 ? Math.round(s.points / s.accumulated).toLocaleString() : '-'}  可視splat ${s.accumulated > 0 ? Math.round(s.visible / s.accumulated).toLocaleString() : '-'}\n`
           + `描画経路 ${s.path === 'sorted' ? 'ソート済みα合成' : 'GPS 粒子'}  GPS需要 ${(s.demand / 1e6).toFixed(1)}M点/ensemble\n`
           + `描画フレーム間隔 p50 ${p(0.5)}ms p95 ${p(0.95)}ms\nGPUバッファ推定 ${s.memory_mib} MiB

@@ -550,6 +550,35 @@ fn prepare_gps(i: u32, pr: Proj, o: f32) -> u32 {
 }
 
 fn prepare_pbvr(i: u32, pr: Proj, o: f32) -> u32 {
+    if (frame.pbvr.x == 4u) {
+        // Discard tails below 1/255 coverage. Solve the cutoff after density scaling.
+        let density = max(frame.prm.x, 1e-8);
+        let amin = max(1.0 - exp(log(1.0 - 1.0 / 255.0) / density), 1e-8);
+        if (o <= amin) { return 0u; }
+        let radius = sqrt(2.0 * log(o / amin));
+        let extent = radius * sqrt(vec2<f32>(pr.a, pr.c));
+        let lo = clamp(floor(pr.mean - extent), vec2<f32>(0.0), vec2<f32>(frame.dims.xy));
+        let hi = clamp(ceil(pr.mean + extent), vec2<f32>(0.0), vec2<f32>(frame.dims.xy));
+        let size = max(hi - lo, vec2<f32>(0.0));
+        let count = u32(size.x) * u32(size.y) * frame.dims.z * frame.dims.z;
+        if (count == 0u) { return 0u; }
+        let invdet = 1.0 / max(pr.a * pr.c - pr.b * pr.b, 1e-30);
+        proj[i * 6u + 1u] = vec4<f32>(lo, size);
+        let peak_tau = -log(1.0 - min(o, 1.0 - 1e-6));
+        // Sparse Poisson trials have exactly the same empty-cell probability as
+        // Bernoulli occupancy, without visiting every cell of a faint footprint.
+        let sparse = density * peak_tau < 1.0;
+        var trials = count;
+        if (sparse) {
+            rng_state = particle_seed(i, 0u, frame.cfg.x);
+            trials = poisson(f32(count) * density * peak_tau);
+        }
+        proj[i * 6u + 2u] = vec4<f32>(pr.c * invdet, -pr.b * invdet, pr.a * invdet, peak_tau);
+        proj[i * 6u + 3u].w = select(0.0, 1.0, sparse);
+        stat_add(5u, trials);
+        stat_add(3u, 1u);
+        return trials;
+    }
     let lambda = pbvr_lambda(pr, o);
     if (!(lambda > 0.0)) { return 0u; }
     let det = pr.a * pr.c - pr.b * pr.b;
@@ -654,7 +683,30 @@ fn particle_pass(gid: vec3<u32>, mode: u32) {
     let b = proj[i * 6u + 1u];
     // Random access: every particle has its own stream, so no thread depends on another's draws.
     rng_state = particle_seed(i, k + 1u, frame.cfg.x);
-    if (frame.pbvr.x == 0u) {
+    if (frame.pbvr.x == 4u) {
+        // Collapse Poisson arrivals into occupancy: P(hit) = 1-exp(-density*tau).
+        // Independent subpixel tests retain alpha; lowering density is not required.
+        let side = frame.dims.z;
+        let samples = side * side;
+        let sparse = proj[i * 6u + 3u].w > 0.0;
+        var cell = k;
+        if (sparse) { cell = min(u32(next() * b.z * b.w * f32(samples)), u32(b.z) * u32(b.w) * samples - 1u); }
+        let pixel = cell / samples;
+        let sub = cell % samples;
+        let xy = vec2<u32>(u32(b.x) + pixel % u32(b.z), u32(b.y) + pixel / u32(b.z));
+        let uv = (vec2<f32>(f32(sub % side), f32(sub / side)) + vec2<f32>(next(), next())) / f32(side);
+        let delta = vec2<f32>(xy) + uv - a.xy;
+        let inv = proj[i * 6u + 2u];
+        let r2 = max(inv.x * delta.x * delta.x + 2.0 * inv.y * delta.x * delta.y + inv.z * delta.y * delta.y, 0.0);
+        let alpha = min(a.w * exp(-0.5 * r2), 1.0 - 1e-6);
+        var coverage = 1.0 - exp(frame.prm.x * log(1.0 - alpha));
+        if (sparse) { coverage = -log(1.0 - alpha) / inv.w; }
+        if (next() >= coverage) { return; }
+        let idx = (xy.y * frame.dims.x + xy.x) * samples + sub;
+        let key = bitcast<u32>(a.z) | 0x80000000u;
+        if (mode == 0u) { stat_add(0u, 1u); atomicMin(&depth[idx], key); }
+        else if (atomicLoad(&depth[idx]) == key) { atomicMin(&winner[idx], i); }
+    } else if (frame.pbvr.x == 0u) {
         emit_particle(i, mode, a.xy, a.z, a.w, b.x, b.y, b.z);
     } else {
         emit_particle_pbvr(i, mode, a, b, proj[i * 6u + 2u], proj[i * 6u + 3u], proj[i * 6u + 4u].xyz, proj[i * 6u + 5u].xyz);

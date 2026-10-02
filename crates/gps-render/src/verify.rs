@@ -250,6 +250,45 @@ pub async fn run_phase2(adapter: &wgpu::Adapter, log: &mut dyn FnMut(String)) ->
         let pass = worst <= 1.01;
         log(format!("[composite] max |8-bit error| vs single-OETF reference = {worst:.2} {}", if pass { "ok" } else { "FAIL" }));
         ok &= pass;
+
+        // Full-size presentation of a half-size accumulation. Check orientation,
+        // edge clamping, pixel-centred interpolation and gamma-after-filtering.
+        let tex = r.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("upsampled composite"),
+            size: wgpu::Extent3d { width: (W * 2) as u32, height: (H * 2) as u32, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: fmt, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut enc = r.device().create_command_encoder(&Default::default());
+        r.composite(&mut enc, &tex.create_view(&Default::default()), &params);
+        r.queue().submit([enc.finish()]);
+        let px = read_texture(&r, &tex, (W * 2) as u32, (H * 2) as u32).await;
+        let mut worst = 0.0f64;
+        for y in 0..H * 2 {
+            for x in 0..W * 2 {
+                let qx = (x as f64 + 0.5) / 2.0 - 0.5;
+                let qy = (y as f64 + 0.5) / 2.0 - 0.5;
+                let ix = qx.floor() as isize;
+                let iy = qy.floor() as isize;
+                let (fx, fy) = (qx - qx.floor(), qy - qy.floor());
+                for c in 0..3 {
+                    let mut lin = 0.0;
+                    for (dx, wx) in [(0, 1.0 - fx), (1, fx)] {
+                        for (dy, wy) in [(0, 1.0 - fy), (1, fy)] {
+                            let a = acc[(iy + dy).clamp(0, H as isize - 1) as usize * W
+                                + (ix + dx).clamp(0, W as isize - 1) as usize];
+                            lin += wx * wy * (a[c] / a[3].max(1.0)) as f64;
+                        }
+                    }
+                    let expect = srgb_oetf(lin.clamp(0.0, 1.0)) * 255.0;
+                    worst = worst.max((px[(y * W * 2 + x) * 4 + c] as f64 - expect).abs());
+                }
+            }
+        }
+        let pass = worst <= 1.01;
+        log(format!("[upsample 2x] max |8-bit error| vs linear bilinear reference = {worst:.2} {}", if pass { "ok" } else { "FAIL" }));
+        ok &= pass;
     }
 
     // A large subpixel count forces 2D dispatch splitting (> 65535 groups).
@@ -424,6 +463,24 @@ pub async fn run_phase3(adapter: &wgpu::Adapter, log: &mut dyn FnMut(String)) ->
         }
     }
 
+    // Screen occupancy preserves projected alpha while collapsing duplicate arrivals.
+    for &si in &[1usize, 3, 4] {
+        let (name, scene) = (all[si].0, &all[si].1);
+        let ana = render_analytic(scene, camera(), W, H, bg);
+        let p = RenderParams { method: Method::ScreenOccupancy, max_points_per_splat: 1, ..base };
+        match render_mean(&mut r, scene, &p, 120, 1).await {
+            Ok(acc) => {
+                let st = r.read_stats().await;
+                let quality = psnr(&to_image(&acc), &ana);
+                let bound = scene.len() as u64 * W as u64 * H as u64 * (base.spp_side * base.spp_side) as u64 * 120;
+                let pass = quality >= 30.0 && st.candidates <= bound && st.orphan_subpixels == 0 && st.truncated_splats == 0;
+                log(format!("[{name} / ScreenOccupancy] PSNR={quality:.1} dB candidates={} bound={bound} orphan={} {}", st.candidates, st.orphan_subpixels, if pass { "ok" } else { "FAIL" }));
+                ok &= pass;
+            }
+            Err(_) => { ok = false; log(format!("[{name} / ScreenOccupancy] render failed")); }
+        }
+    }
+
     // ViewConditioned has no CPU oracle (the C++ one is GPU-only): check it against GPS itself.
     for &si in &[1usize, 3, 4] {
         let (sname, scene) = (all[si].0, &all[si].1);
@@ -455,6 +512,19 @@ pub async fn run_phase3(adapter: &wgpu::Adapter, log: &mut dyn FnMut(String)) ->
             st_vc.orphan_subpixels,
             if pass { "ok" } else { "FAIL" }
         ));
+        ok &= pass;
+    }
+
+    // Both occupancy streams must be replayed identically by depth/colour passes.
+    for density in [0.25, 2.0] {
+        let p = RenderParams { method: Method::ScreenOccupancy, density_scale: density, max_points_per_splat: 1, ..base };
+        let scene = &all[3].1;
+        let a = render_mean(&mut r, scene, &p, 8, 500).await.unwrap_or_default();
+        let b = render_mean(&mut r, scene, &p, 8, 500).await.unwrap_or_default();
+        let d = render_mean(&mut r, scene, &p, 8, 600).await.unwrap_or_default();
+        let st = r.read_stats().await;
+        let pass = !a.is_empty() && a == b && a != d && st.orphan_subpixels == 0;
+        log(format!("[ScreenOccupancy density={density}] deterministic / pass replay {}", if pass { "ok" } else { "FAIL" }));
         ok &= pass;
     }
 
